@@ -1,0 +1,201 @@
+' operationId: uploadContent
+' method: PUT
+' path: /api/v1/uploads/{uploadId}/content
+' Общие правила REQ, ACL, UPLOAD_ACCESS, FAIL_TRANSFER, CLEANUP, ERR: README.md.
+@startuml uploadContent_AD
+title Передача содержимого в сессию загрузки\nPUT /sprut-file-manager/api/v1/uploads/{uploadId}/content
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam partitionBorderColor #7950F2
+skinparam partitionBackgroundColor #F3F0FF
+skinparam activityBackgroundColor #E7F5FF
+|SPRUT-FILE-MANAGER|
+start
+:Request;
+note right
+  Request: PUT /sprut-file-manager/api/v1/uploads/{uploadId}/content
+  Path:
+    uploadId*
+  Headers:
+    Content-Length?, X-Actor-Id*, X-Actor-Type*, X-Actor-Roles?, X-Actor-Groups?
+    X-Correlation-Id?, traceparent?, tracestate?
+  Content-Type*: application/octet-stream
+  Body:
+    bytes* — поток файла, включая 0 bytes
+  Обозначения: * обязательное, ? необязательное, (null) допускает null
+end note
+:Получить uploadId, Content-Type и необязательный Content-Length;
+if (Content-Type != application/octet-stream?) then (да)
+  :Ответ 415 MEDIA_TYPE_UNSUPPORTED;
+  stop
+endif
+if (Content-Length задан и > maxFileBytes?) then (да)
+  :Ответ 413 REQUEST_BODY_TOO_LARGE;
+  stop
+endif
+:Найти upload_session по id = uploadId
+с JOIN storage_space по configuredTenantId;
+if (Сессия не найдена?) then (да)
+  :Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+partition "TX 1 — создание попытки, READ COMMITTED" {
+:BEGIN. Найти storage_space s по space_id FOR SHARE.
+Повторно прочитать upload_session u по id = uploadId FOR UPDATE;
+if (Сессия удалена после первоначального поиска?) then (да)
+  :ROLLBACK. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+:Получить target, предков и grants по UPLOAD_ACCESS;
+if (Target отсутствует или скрыт по UPLOAD_ACCESS?) then (да)
+  :ROLLBACK. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (u.created_by != actorId и нет ADMIN для target?) then (да)
+  :ROLLBACK. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (s.status = DISABLED?) then (да)
+  :ROLLBACK. Ответ 403 SPACE_DISABLED;
+  stop
+endif
+if (s.status = READ_ONLY?) then (да)
+  :ROLLBACK. Ответ 403 SPACE_READ_ONLY;
+  stop
+endif
+if (Нет WRITE для target?) then (да)
+  :ROLLBACK. Ответ 403 ACCESS_DENIED;
+  stop
+endif
+if (u.status = COMPLETED?) then (да)
+  :ROLLBACK. Ответ 409 UPLOAD_ALREADY_COMPLETED;
+  stop
+endif
+if (u.status = ABORTED?) then (да)
+  :ROLLBACK. Ответ 409 UPLOAD_ABORTED;
+  stop
+endif
+if (u.status = FAILED?) then (да)
+  :ROLLBACK. Ответ 409 UPLOAD_WRITER_CONFLICT;
+  stop
+endif
+if (u.status = EXPIRED или u.expires_at <= now?) then (да)
+  :ROLLBACK. Ответ 410 UPLOAD_EXPIRED;
+  stop
+endif
+if (Заданы обе длины, Content-Length != u.expected_size_bytes?) then (да)
+  :ROLLBACK. Ответ 422 UPLOAD_SIZE_MISMATCH;
+  stop
+endif
+:Найти upload_attempt a по u.current_attempt_id FOR UPDATE;
+if (a.status IN UPLOADED, VERIFYING, VERIFIED?) then (да)
+  :ROLLBACK. Ответ 409 UPLOAD_WRITER_CONFLICT;
+  stop
+endif
+if (a.status IN RESERVED, UPLOADING и a.lease_until > now?) then (да)
+  :ROLLBACK. Ответ 409 UPLOAD_WRITER_CONFLICT;
+  stop
+endif
+if (Есть старая незавершённая a?) then (да)
+  :a.status = EXPIRED, lease_token += 1,
+  lease_owner/lease_until = NULL.
+  Поставить точную cleanup task по CLEANUP;
+endif
+:INSERT content_object: новый objectId,
+space_id = u.space_id, object_key = spacePrefix + objects/ + objectId,
+status = RESERVED;
+:INSERT upload_attempt: новый attemptId, upload_session_id = uploadId,
+content_object_id = objectId, attempt_number = previous + 1,
+status = UPLOADING, lease_owner = writerId, lease_token = 1,
+lease_until = now + writerLease, uploaded_bytes = 0;
+:UPDATE u: current_attempt_id = attemptId,
+status = UPLOADING, revision += 1. COMMIT;
+}
+:Вне TX передавать body в MinIO по новому key.
+Считать actualBytes и SHA-256 ограниченными buffers.
+Короткими fenced TX продлевать lease и обновлять uploaded_bytes.
+Перечисленные ниже ошибки проверяются во время передачи,
+при первой ошибке I/O прекращается;
+if (actualBytes > maxFileBytes?) then (да)
+  :FAIL_TRANSFER для attemptId/token: FILE_TOO_LARGE.
+  Ответ 413 REQUEST_BODY_TOO_LARGE;
+  stop
+endif
+if (Клиент разорвал соединение?) then (да)
+  :FAIL_TRANSFER для attemptId/token: CLIENT_DISCONNECTED.
+  Записать uploadId/attemptId/correlationId. HTTP-ответ невозможен;
+  stop
+endif
+if (Истёк deadline приёма HTTP body?) then (да)
+  :FAIL_TRANSFER для attemptId/token: UPLOAD_TIMEOUT.
+  Ответ 408 RESOURCE_LIMIT_EXCEEDED, если соединение открыто;
+  stop
+endif
+if (MinIO завершился ошибкой или timeout?) then (да)
+  :FAIL_TRANSFER для attemptId/token: DEPENDENCY_UNAVAILABLE.
+  Ответ 503 DEPENDENCY_UNAVAILABLE;
+  stop
+endif
+if (Не удалось продлить lease или token уже не текущий?) then (да)
+  :Прекратить I/O. Поставить cleanup старого object по CLEANUP.
+  Ответ 409 UPLOAD_WRITER_CONFLICT;
+  stop
+endif
+if (actualBytes не совпал с заданным Content-Length?) then (да)
+  :FAIL_TRANSFER для attemptId/token: SIZE_MISMATCH.
+  Ответ 422 UPLOAD_SIZE_MISMATCH;
+  stop
+endif
+if (expected_size_bytes задан и actualBytes отличается?) then (да)
+  :FAIL_TRANSFER для attemptId/token: SIZE_MISMATCH.
+  Ответ 422 UPLOAD_SIZE_MISMATCH;
+  stop
+endif
+partition "TX 2 — сохранение receipt, READ COMMITTED" {
+:BEGIN. В порядке space → session → attempt → object
+заблокировать записи и повторно прочитать их;
+if (u.status = ABORTED?) then (да)
+  :ROLLBACK. Поставить cleanup exact object по CLEANUP.
+  Ответ 409 UPLOAD_ABORTED;
+  stop
+endif
+if (u.status = EXPIRED или u.expires_at <= now?) then (да)
+  :ROLLBACK. Поставить cleanup exact object по CLEANUP.
+  Ответ 410 UPLOAD_EXPIRED;
+  stop
+endif
+if (u.status != UPLOADING или u.current_attempt_id != attemptId\nили a.status != UPLOADING или a.lease_token != token\nили a.lease_until <= now?) then (да)
+  :ROLLBACK. Поставить cleanup exact object по CLEANUP.
+  Ответ 409 UPLOAD_WRITER_CONFLICT;
+  stop
+endif
+:UPDATE content_object: provider_version_id,
+size_bytes = actualBytes, checksum_sha256 = streamHash.
+UPDATE attempt: status = UPLOADED, uploaded_at = txTime,
+uploaded_bytes = actualBytes, lease_owner/lease_until = NULL;
+:COMMIT;
+}
+:Ответ 200 Upload;
+note right
+Response
+200:
+  Headers:
+    Location, X-Correlation-Id
+  Content-Type: application/json
+  Body: Upload
+    id*, spaceId*, status*, parentId? (null), fileNodeId? (null)
+    expectedSizeBytes* (null), uploadedBytes*, resultVersionId? (null), expiresAt*
+    createdAt*, errorCode? (null), transferStatus*, attemptNumber*
+Ошибки: application/problem+json
+  type*, title*, status*, code*, detail?, instance?, requestId*, violations?[]
+  correlationId*, traceId? (null)
+  violations?[]: field*, code*, message*
+Обозначения: * обязательное, ? необязательное, (null) допускает null
+
+  UPLOADED означает полный object receipt, не публикацию.
+  MIME будущего файла хранится в session.
+  Offset resume не поддерживается.
+  Для публикации используется POST complete.
+end note
+stop
+@enduml

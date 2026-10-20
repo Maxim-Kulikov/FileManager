@@ -1,0 +1,116 @@
+' operationId: listChildren
+' method: GET
+' path: /api/v1/nodes/{nodeId}/children
+' Общие правила REQ, ACL, ERR: README.md.
+@startuml listChildren_AD
+title Содержимое папки\nGET /sprut-file-manager/api/v1/nodes/{nodeId}/children
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam partitionBorderColor #7950F2
+skinparam partitionBackgroundColor #F3F0FF
+skinparam activityBackgroundColor #E7F5FF
+|SPRUT-FILE-MANAGER|
+start
+:Request;
+note right
+  Request: GET /sprut-file-manager/api/v1/nodes/{nodeId}/children
+  Path:
+    nodeId*
+  Query:
+    pageSize?, cursor?, recursive?, type?, marker?
+  Headers:
+    X-Actor-Id*, X-Actor-Type*, X-Actor-Roles?, X-Actor-Groups?
+    X-Correlation-Id?, traceparent?, tracestate?
+  Body: отсутствует
+  Обозначения: * обязательное, ? необязательное, (null) допускает null
+end note
+:Получить nodeId, pageSize, cursor, recursive, type, marker;
+if (Передан cursor?) then (да)
+  :Проверить подпись cursor и сравнить tenantId, nodeId,
+  recursive, type, marker, pageSize с текущим запросом;
+  if (Подпись или параметры не совпали?) then (да)
+    :Ответ 400 CURSOR_MISMATCH;
+    stop
+  endif
+  if (cursor.expiresAt <= now?) then (да)
+    :Ответ 410 CURSOR_EXPIRED;
+    stop
+  endif
+endif
+partition "TX — PostgreSQL, REPEATABLE READ (read-only)" {
+:Начать read-only TX REPEATABLE READ;
+:Найти fs_node folder по id = nodeId,
+storage_space s по id = folder.space_id
+и tenant_id = configuredTenantId;
+if (Узел не найден?) then (да)
+  :Завершить TX. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+:Получить предков folder из UUID-цепочки tree_path по TREE
+и grants по ACL;
+if (folder или предок не ACTIVE?) then (да)
+  :Завершить TX. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (s.status = DISABLED?) then (да)
+  :Завершить TX. Ответ 403 SPACE_DISABLED;
+  stop
+endif
+if (Нет READ для folder или видимости предков?) then (да)
+  :Завершить TX. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (folder.node_type != FOLDER?) then (да)
+  :Завершить TX. Ответ 409 NODE_TYPE_MISMATCH;
+  stop
+endif
+if (recursive = false?) then (да)
+  :Выбрать ACTIVE fs_node по parent_id = nodeId;
+else (рекурсивно)
+  :Выбрать FOLDER по tree_path <@ folder.tree_path,
+  исключить сам folder.
+  FILE выбрать через JOIN parent FOLDER:
+  parent.tree_path <@ folder.tree_path;
+endif
+:Отсеять узлы под не ACTIVE или скрытыми предками по TREE.
+Применить READ и фильтры type/marker до LIMIT.
+recursive=false: порядок FOLDER first, normalized_name, id.
+recursive=true: порядок id.
+Продолжить после последнего ключа cursor,
+выбрать не более pageSize + 1 видимых записей;
+:hasMore = число записей > pageSize.
+Сформировать items из первых pageSize записей,
+path и file metadata прочитать в том же snapshot;
+:Если hasMore, подписать nextCursor по ключу
+последнего выданного элемента, иначе nextCursor = NULL;
+:Завершить read-only TX;
+}
+:Ответ 200 NodePage;
+note right
+Response
+200:
+  Headers:
+    X-Correlation-Id
+  Content-Type: application/json
+  Body: NodePage
+    items*[], nextCursor* (null), hasMore*
+    items[]:
+      id*, spaceId*, parentId* (null), type*, name*, path*, markers*, revision*
+      status*, createdAt*, updatedAt*, trashedAt? (null), file?
+      file (только FILE):
+        currentVersionId* (null), contentRevision*, sizeBytes* (null)
+        contentType* (null), checksumSha256* (null)
+Ошибки: application/problem+json
+  type*, title*, status*, code*, detail?, instance?, requestId*, violations?[]
+  correlationId*, traceId? (null)
+  violations?[]: field*, code*, message*
+Обозначения: * обязательное, ? необязательное, (null) допускает null
+
+  Между страницами нет общего snapshot.
+  Concurrent rename/move допускает пропуски и повторы.
+  Клиент дедуплицирует items по nodeId.
+  tree_path — внутренний индекс папок, в Node не возвращается.
+  pageSize не ограничивает число кандидатов БД, действуют DB timeout и I/O budgets.
+end note
+stop
+@enduml

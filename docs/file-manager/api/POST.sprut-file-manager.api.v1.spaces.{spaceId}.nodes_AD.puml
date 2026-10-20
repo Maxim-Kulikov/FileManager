@@ -1,0 +1,149 @@
+' operationId: createNode
+' method: POST
+' path: /api/v1/spaces/{spaceId}/nodes
+' Общие правила REQ, ACL, IDEMP, HIST, INDEX, ERR: README.md.
+@startuml createNode_AD
+title Создание папки или placeholder файла\nPOST /sprut-file-manager/api/v1/spaces/{spaceId}/nodes
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam partitionBorderColor #7950F2
+skinparam partitionBackgroundColor #F3F0FF
+skinparam activityBackgroundColor #E7F5FF
+|SPRUT-FILE-MANAGER|
+start
+:Request;
+note right
+  Request: POST /sprut-file-manager/api/v1/spaces/{spaceId}/nodes
+  Path:
+    spaceId*
+  Headers:
+    Idempotency-Key*, X-Actor-Id*, X-Actor-Type*, X-Actor-Roles?
+    X-Actor-Groups?, X-Correlation-Id?, traceparent?, tracestate?
+  Content-Type*: application/json
+  Body:
+    parentId*, type*, name*, markers?
+  Обозначения: * обязательное, ? необязательное, (null) допускает null
+end note
+:Получить spaceId, parentId, type, name, markers и Idempotency-Key.
+Нормализовать name в NFC, вычислить normalized_name,
+markers = отсортированное множество, default [];
+if (name равен dot/dotdot или превышены правила имени?) then (да)
+  :Ответ 422 VALIDATION_ERROR, violations.name;
+  stop
+endif
+:scope = tenant + actor + createNode + spaceId + parentId.
+request_hash = SHA-256 канонических parentId, type, name, markers;
+partition "TX — создание узла, READ COMMITTED" {
+:BEGIN. Найти storage_space s по id = spaceId
+и tenant_id = configuredTenantId FOR UPDATE;
+if (Пространство не найдено?) then (да)
+  :ROLLBACK. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (s.status = DISABLED?) then (да)
+  :ROLLBACK. Ответ 403 SPACE_DISABLED;
+  stop
+endif
+if (s.status = READ_ONLY?) then (да)
+  :ROLLBACK. Ответ 403 SPACE_READ_ONLY;
+  stop
+endif
+:Найти fs_node parent по id = parentId и space_id = spaceId.
+Получить цепочку предков и grants по ACL;
+if (Родитель не найден?) then (да)
+  :ROLLBACK. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (parent или предок не ACTIVE?) then (да)
+  :ROLLBACK. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (Нет видимости цепочки предков?) then (да)
+  :ROLLBACK. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (parent.node_type != FOLDER?) then (да)
+  :ROLLBACK. Ответ 422 NODE_TYPE_MISMATCH;
+  stop
+endif
+if (Нет WRITE для parent?) then (да)
+  :ROLLBACK. Ответ 403 ACCESS_DENIED;
+  stop
+endif
+:INSERT idempotency_record по scope + key ON CONFLICT DO NOTHING.
+При конфликте SELECT этой записи FOR UPDATE;
+if (Существующая запись имеет другой request_hash?) then (да)
+  :ROLLBACK. Ответ 409 IDEMPOTENCY_KEY_REUSED;
+  stop
+endif
+if (Запись уже содержит response_status?) then (да)
+  :Найти сохранённый resource_id и проверить replay по IDEMP;
+  if (Результат истёк или физически удалён?) then (да)
+    :ROLLBACK. Ответ 410 IDEMPOTENCY_RESULT_EXPIRED;
+    stop
+  endif
+  if (Результат скрыт текущими правами?) then (да)
+    :ROLLBACK. Ответ 404 RESOURCE_NOT_FOUND;
+    stop
+  endif
+  :COMMIT без изменений. Ответ 201 с сохранённым Node;
+  stop
+endif
+:Проверить parent.tree_path по TREE.
+depth нового узла = nlevel(parent.tree_path).
+Вычислить длину logical path по текущим именам;
+if (Превышены maxDepth или maxPathLength?) then (да)
+  :ROLLBACK. Ответ 422 VALIDATION_ERROR;
+  stop
+endif
+:Выделить nodeId. Для FOLDER вычислить
+tree_path = parent.tree_path || label(nodeId), для FILE — NULL;
+:INSERT fs_node: id = nodeId, space_id = spaceId, tree_path,
+parent_id = parentId, node_type = type, name, normalized_name,
+markers, status = ACTIVE, revision = search_revision = 1,
+created_by = actorId, created_at = updated_at = txTime;
+if (Нарушен UNIQUE активного sibling name?) then (да)
+  :ROLLBACK. Ответ 409 NAME_COLLISION;
+  stop
+endif
+if (type = FILE?) then (да)
+  :INSERT file_entry: node_id = новый nodeId,
+  current_version_id = NULL, content_revision = 0,
+  updated_at = txTime;
+endif
+:INSERT node_revision: node_id = nodeId, revision = 1,
+parent_node_id = parentId, name, markers, status = ACTIVE,
+file_version_id = NULL, valid_from = txTime, valid_to = NULL;
+:INSERT audit_event action = CREATE для nodeId.
+INSERT search_index_task NODE, UPSERT,
+desired_revision = 1, status = PENDING по правилу INDEX;
+:UPDATE storage_space: authorization_revision += 1.
+UPDATE idempotency_record: resource_id = nodeId,
+response_status = 201, response_body = Node;
+:COMMIT;
+}
+:Ответ 201 Node, Location по nodeId, metadata ETag;
+note right
+Response
+201:
+  Headers:
+    ETag, Location, X-Correlation-Id
+  Content-Type: application/json
+  Body: Node
+    id*, spaceId*, parentId* (null), type*, name*, path*, markers*, revision*
+    status*, createdAt*, updatedAt*, trashedAt? (null), file?
+    file (только FILE):
+      currentVersionId* (null), contentRevision*, sizeBytes* (null)
+      contentType* (null), checksumSha256* (null)
+Ошибки: application/problem+json
+  type*, title*, status*, code*, detail?, instance?, requestId*, violations?[]
+  correlationId*, traceId? (null)
+  violations?[]: field*, code*, message*
+Обозначения: * обязательное, ? необязательное, (null) допускает null
+
+  FOLDER не создаёт S3 marker.
+  FILE создаёт placeholder без bytes.
+  Реальный файл, включая 0 bytes, публикуется через upload.
+end note
+stop
+@enduml

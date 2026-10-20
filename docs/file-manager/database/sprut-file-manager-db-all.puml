@@ -1,0 +1,1180 @@
+' Полная схема sprut-file-manager: все 27 таблиц на одном полотне.
+' Генерируется tools/sync-db-diagrams.cjs из шести самостоятельных детальных схем.
+' Править таблицы и ограничения следует в детальных схемах; --check проверяет отсутствие drift.
+' Ограничения CHECK/FK/UNIQUE и индексы указаны в комментариях.
+@startuml sprut-file-manager-db-all
+title sprut-file-manager — полная PostgreSQL модель
+hide methods
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam packageStyle rectangle
+' Просторная компоновка без scale/fit-to-width.
+skinparam nodesep 150
+skinparam ranksep 180
+skinparam padding 2
+skinparam ArrowFontSize 12
+legend left
+  |= Обозначение |= Значение |
+  | <<PK>> | колонка первичного ключа; несколько PK = один составной ключ |
+  | <<FK>> | внешний ключ |
+  | * | обязательная колонка |
+  | Допустимые значения | константы, а не дополнительные колонки |
+  | revision / lease_token | CAS и защита от устаревшего worker |
+endlegend
+package "PostgreSQL — sprut-file-manager" as pkg_db #F8F9FA {
+  ' Источник: sprut-file-manager-db-namespace.puml
+  package "Дерево, доступ и история" as pkg_namespace #E7F5FF {
+    entity "storage_space" as storage_space #E7F5FF {
+      ' Допустимые значения колонок.
+      .. Допустимые значения ..
+      {field} status = ACTIVE | READ_ONLY | DISABLED
+      == Колонки ==
+      ' Логическое пространство; граница доступа, retention и S3 namespace.
+      * id : UUID <<PK>> [ID логического файлового пространства]
+      --
+      ' Владелец; проверяется во всех запросах и заданиях.
+      * tenant_id : UUID [Владелец данных; граница изоляции tenant]
+      * name : VARCHAR(255) [Отображаемое имя файлового пространства]
+      ' Фиксация общего физического размещения; не выбор подключения.
+      * storage_binding_fingerprint : CHAR(64) [SHA-256 канонического физического размещения; без credentials]
+      * search_binding_fingerprint : CHAR(64) [SHA-256 поискового размещения; не конфигурация клиента]
+      * revision : BIGINT [CAS изменяемых metadata пространства]
+      * authorization_revision : BIGINT [Поколение локальных ACL, ролей и структуры, влияющей на доступ]
+      * bucket_name : VARCHAR(255) [Имя S3 bucket; без credentials]
+      ' Физический префикс, принадлежащий только этому space.
+      * key_prefix : VARCHAR(1024) [Физический префикс объектов этого пространства]
+      ' Изменение политики не освобождает существующие holds.
+      * retention_policy_id : UUID <<FK>> [Политика хранения истории, версий и задач]
+      ' Watermark: до этого момента restore гарантировать нельзя.
+      * restore_available_from : TIMESTAMPTZ [Самый ранний гарантированно доступный момент restore]
+      ' ACTIVE / READ_ONLY / DISABLED.
+      * status : VARCHAR(32) [Режим пространства: доступно, только чтение или отключено]
+      * created_at : TIMESTAMPTZ [Время создания записи]
+      * updated_at : TIMESTAMPTZ [Время последнего изменения записи]
+    }
+
+    entity "fs_node" as fs_node #E7F5FF {
+      ' Допустимые значения колонок.
+      .. Допустимые значения ..
+      {field} node_type = FILE | FOLDER
+      {field} status = ACTIVE | TRASHED | PURGING
+      {field} markers [codes] = TEST_CASE | REFERENCE | NEEDS_REVIEW
+      {field} markers [default] = []
+      {field} tree_path [FOLDER] = цепочка UUID-меток от корня до узла
+      {field} tree_path [FILE] = NULL
+      == Колонки ==
+      ' Стабильный ID; rename и move не меняют его.
+      * id : UUID <<PK>> [Стабильный ID файла или папки; не меняется при move]
+      --
+      * space_id : UUID <<FK>> [Файловое пространство, которому принадлежит запись]
+      ' NULL только у единственного корня space.
+      parent_id : UUID <<FK>> [Родительская папка; NULL только для корня пространства]
+      ' Производный путь из стабильных ID; NOT NULL только для FOLDER, у FILE всегда NULL.
+      tree_path : LTREE [Технический путь папки; не имя, logical path или S3 key]
+      ' FILE / FOLDER.
+      * node_type : VARCHAR(16) [Тип узла: файл или папка]
+      * name : VARCHAR(255) [Имя узла, отображаемое пользователю]
+      ' Имя с учётом политики регистра.
+      * normalized_name : VARCHAR(255) [Имя для сравнения и уникальности с учётом регистра]
+      ' Множество стабильных кодов для UI; NOT NULL DEFAULT '{}'::text[].
+      * markers : TEXT[] [Коды UI-маркеров; без наследования, пустой массив допустим]
+      ' CAS структуры и metadata, включая markers; номер node_revision растёт при изменении состояния.
+      * revision : BIGINT [Номер состояния metadata; CAS для rename, move и markers]
+      ' Версия search projection, включая изменение пути через предка.
+      * search_revision : BIGINT [Номер поисковой проекции; учитывает смену пути]
+      ' ACTIVE / TRASHED / PURGING.
+      * status : VARCHAR(32) [Состояние узла: активен, в корзине или очищается]
+      created_by : UUID [Пользователь или сервис, создавший запись]
+      * created_at : TIMESTAMPTZ [Время создания записи]
+      * updated_at : TIMESTAMPTZ [Время последнего изменения записи]
+      ' Попадание в корзину, а не физическое удаление.
+      trashed_at : TIMESTAMPTZ [Время попадания в корзину; NULL до удаления]
+    }
+
+    entity "file_entry" as file_entry #EBFBEE {
+      ' Расширение fs_node только для FILE.
+      * node_id : UUID <<PK,FK>> [ID файлового узла; одновременно PK и FK на fs_node]
+      --
+      ' NULL до первого upload; FK только на версию этого файла.
+      current_version_id : UUID <<FK>> [Текущая версия этого файла; NULL до первого upload]
+      ' CAS содержимого защищает от параллельного сохранения.
+      * content_revision : BIGINT [Номер состояния содержимого; CAS при сохранении]
+      * updated_at : TIMESTAMPTZ [Время последнего изменения текущего содержимого]
+    }
+
+    entity "node_revision" as node_revision #FFF9DB {
+      ' Допустимые значения колонок.
+      .. Допустимые значения ..
+      {field} status = ACTIVE | TRASHED
+      {field} markers [codes] = TEST_CASE | REFERENCE | NEEDS_REVIEW
+      {field} markers [default] = []
+      == Колонки ==
+      ' История namespace и current content для restore дерева на T.
+      * id : UUID <<PK>> [ID исторического состояния узла]
+      --
+      * node_id : UUID <<FK>> [Узел, история которого сохраняется]
+      * revision : BIGINT [Номер исторического состояния внутри узла]
+      ' Исторический parent ID без FK на живой узел: не мешает purge.
+      parent_node_id : UUID [Родитель в этом состоянии; NULL у корня, без FK]
+      * name : VARCHAR(255) [Имя узла в этом историческом состоянии]
+      ' Снимок маркеров на этом интервале; NOT NULL DEFAULT '{}'::text[].
+      * markers : TEXT[] [Снимок кодов маркеров на интервале действия]
+      ' ACTIVE / TRASHED; созданный после T узел не имеет состояния на T.
+      * status : VARCHAR(32) [Историческое состояние: активен или в корзине]
+      ' Историческая content version; NULL для FOLDER.
+      file_version_id : UUID <<FK>> [Историческая версия содержимого; NULL для папки]
+      ' Интервал [valid_from, valid_to); NULL valid_to = текущий.
+      * valid_from : TIMESTAMPTZ [Начало действия состояния; включается в интервал]
+      valid_to : TIMESTAMPTZ [Конец действия состояния; не включается, NULL у текущего]
+      ' Логический ID операции без FK на удаляемый job.
+      operation_id : UUID [Операция, создавшая состояние; логическая ссылка без FK]
+      actor_id : UUID [Пользователь или сервис, выполнивший действие]
+    }
+
+    entity "node_acl" as node_acl #FFF9DB {
+      ' Допустимые значения колонок.
+      .. Допустимые значения ..
+      {field} subject_type = USER | GROUP | SERVICE | ROLE
+      {field} inheritance_mode = SELF | CHILDREN | SUBTREE
+      {field} permission_mask [flags] = READ=1 | WRITE=2 | DELETE=4
+      {field} permission_mask [flags] = SHARE=8 | ADMIN=16
+      {field} permission_mask [combine] = побитовое OR
+      == Колонки ==
+      * id : UUID <<PK>> [ID записи права доступа]
+      --
+      * node_id : UUID <<FK>> [Узел, на котором назначено право]
+      ' USER / GROUP / SERVICE / ROLE; прямые grants сохраняются.
+      * subject_type : VARCHAR(16) [Тип получателя права: пользователь, группа или сервис]
+      subject_id : UUID [Внешний USER/GROUP/SERVICE; NULL при subject_type=ROLE]
+      role_id : UUID <<FK>> [Локальная роль пространства; только для subject_type=ROLE]
+      ' Битовая маска: READ=1, WRITE=2, DELETE=4, SHARE=8, ADMIN=16; комбинация через OR.
+      permission_mask : INTEGER [Прямой grant: маска; ROLE: NULL, права читаются из role_permission]
+      ' SELF / CHILDREN / SUBTREE.
+      * inheritance_mode : VARCHAR(16) [Область действия: сам узел, дети или всё поддерево]
+      created_by : UUID [Пользователь или сервис, создавший запись]
+      * created_at : TIMESTAMPTZ [Время создания записи]
+      revoked_at : TIMESTAMPTZ [Время отзыва права; NULL пока оно действует]
+    }
+
+    /' note bottom of fs_node
+    Один корень: UNIQUE(space_id) WHERE parent_id IS NULL.
+    Имя: UNIQUE(space_id, parent_id, normalized_name)
+    WHERE status = 'ACTIVE' AND parent_id IS NOT NULL.
+    INDEX(space_id, parent_id, status, normalized_name, id).
+    CREATE EXTENSION IF NOT EXISTS ltree выполняется Liquibase до создания колонки.
+    CHECK ((node_type='FOLDER' AND tree_path IS NOT NULL)
+    OR (node_type='FILE' AND tree_path IS NULL)).
+    CHECK для FOLDER: nlevel(tree_path) >= 1 и последняя метка соответствует id.
+    label(id) = 'n_' + lower(UUID без дефисов); root.tree_path = label(root.id).
+    FOLDER: tree_path = parent.tree_path || label(id); parent в том же space.
+    Последняя метка равна label(id); depth папки = nlevel(tree_path)-1.
+    Depth файла = nlevel(parent.tree_path); root имеет depth=0.
+    GiST(tree_path) WHERE node_type='FOLDER' для <@ и @>.
+    INDEX(space_id,parent_id,id) WHERE status='ACTIVE' для ID-keyset детей.
+    INDEX(space_id,parent_id,id) WHERE node_type='FOLDER' для структурного обхода.
+    Родитель — FOLDER в том же space; move запрещает циклы.
+    parent_id задаёт структуру; tree_path поддерживается синхронно, не через worker.
+    Deferred constraint trigger при INSERT/изменении parent_id или tree_path
+    проверяет текущую папку, её parent и прямых детей FOLDER; не вызывается при rename-only.
+    Обычный CHECK не читает parent: межстрочная согласованность проверяется отдельно.
+    Структурные изменения используют exclusive space lock и свежий snapshot.
+    Rename сохраняет tree_path. Move файла оставляет tree_path=NULL.
+    Move папки атомарно меняет parent_id источника и prefix всех вложенных папок,
+    включая TRASHED/PURGING; внутри TX допускаются пакеты UPDATE, между ними нет COMMIT.
+    Превышение maxAtomicMoveFolders: 413 RESOURCE_LIMIT_EXCEEDED до изменения структуры.
+    Derived rewrite потомка не меняет его revision/updated_at и не создаёт node_revision.
+    Source move создаёт history/audit и SUBTREE index intent; байты S3 не перемещаются.
+    Logical path строится по текущим именам узлов UUID-цепочки; tree_path в REST не выдаётся.
+    FILE выбирается через parent_id и tree_path родительской папки, не собственный tree_path.
+    Потомки root: FOLDER tree_path <@ root.tree_path, для FILE parent.tree_path <@ root.tree_path.
+    Равенство включает root; children исключает его явно. Ancestors берутся по меткам ID.
+    Отбор TEST_CASE: только FOLDER + markers @> ARRAY['TEST_CASE']::text[] + scope по ltree.
+    Tenant/space, status всех предков и ACL проверяются независимо от совпадения пути.
+    markers — только прямое назначение узлу, без наследования от папок.
+    Начальный набор: TEST_CASE, REFERENCE, NEEDS_REVIEW; не пользовательский справочник.
+    CHECK(markers <@ ARRAY['TEST_CASE','REFERENCE','NEEDS_REVIEW']::text[]).
+    CHECK(array_position(markers, NULL) IS NULL); пустой массив допустим.
+    Одномерный массив с lower bound = 1 либо пустой; без дублей.
+    API валидирует коды и записывает уникальные значения в стабильном порядке.
+    Реальное изменение markers: CAS revision, updated_at, новая node_revision,
+    bump search_revision + NODE search_index_task и audit_event в одной TX.
+    Не меняет file_version/content_revision и не записывает байты в S3.
+    Тот же набор кодов — no-op: без новой revision/истории/index task.
+    GIN(markers) добавлять только при измеренной необходимости фильтра по маркеру.
+    '/
+
+    /' note bottom of node_revision
+    UNIQUE(node_id, revision); один открытый интервал на node_id.
+    Интервалы одного узла не пересекаются.
+    Смена namespace/markers/current_version закрывает старую revision
+    и создаёт новую в той же транзакции.
+    На границе retention сохраняется состояние, начавшееся ДО границы.
+    Restore восстанавливает структуру/markers/содержимое; ACL не откатывается.
+    Marker-only revision повторно ссылается на ту же file_version.
+    tree_path не хранится в node_revision: это производный индекс текущего дерева.
+    Restore/rollback вычисляют пути из актуального parent в той же TX, не копируют старый prefix.
+    Перемещение исторической папки меняет пути её текущих вложенных папок атомарно;
+    при превышении maxAtomicMoveFolders item завершается FAILED/RESOURCE_LIMIT_EXCEEDED без изменений.
+    Историческое дерево на T строится по parent_node_id на T, не по текущему tree_path.
+    Узел удаляется лишь после истечения истории/holds.
+    '/
+
+    /' note bottom of node_acl
+    ROLE: role_id NOT NULL; subject_id и permission_mask NULL.
+    USER/GROUP/SERVICE: subject_id и permission_mask NOT NULL; role_id NULL.
+    Роль и узел принадлежат одному space; роль ACTIVE.
+    Роль сама по себе не даёт доступа: требуется действующий node_acl binding.
+    Права ROLE читаются из текущего role_permission, не копируются в grant.
+    SELF = узел; CHILDREN = прямые дети; SUBTREE = узел и все потомки.
+    Только ALLOW; разрешения объединяются. Потомок не отменяет grant предка.
+    Отзыв доступа сериализуется с публикацией результата worker.
+    Эффективные права вычисляются из ACL/ACTIVE ролей/доверенной identity; отдельной таблицы нет.
+    INDEX(role_id,node_id) WHERE revoked_at IS NULL AND subject_type='ROLE' для обратных bindings.
+    Архивирование роли прекращает её действие без удаления аудита и UUID.
+    '/
+
+    /' note bottom of storage_space
+    tenant_id берётся из sprut.file-manager.tenant-id, не из запроса.
+    Единственный S3 endpoint берётся из YAML; bucket_name/key_prefix
+    фиксируют размещение. Переезд существующих объектов не является PATCH metadata.
+    Все spaces используют общие MinIO/OpenSearch; выбора подключения нет.
+    В space хранятся immutable binding metadata/fingerprints, не endpoints и не secrets.
+    Общий YAML задаёт bucket/base-prefix; space получает prefix base/spaces/spaceId/.
+    При старте сверяются общие targets/fingerprints всех spaces; mismatch блокирует admission.
+    Fingerprints исключают credentials и client timeouts; новое размещение требует migration/cutover.
+    Уникальные space UUID/prefix не допускают overlap пространств.
+    Policy принадлежит configured tenant; raw bucket/endpoint/prefix в createSpace запрещены.
+    Первое пространство создаётся через MVC или REST. Ноль spaces допустим при старте.
+    authorization_revision монотонно меняется при ACL/role и любой структурной mutation:
+    create/rename/move/trash/restore, NEW upload и purge metadata; контентный UPDATE его не меняет.
+    authorization_revision NOT NULL DEFAULT 1, CHECK authorization_revision >= 1.
+    Это не metadata revision и не доказательство полномочий без проверки ACL/identity.
+    Локальная авторизация mutations: короткая TX берёт shared lock строки space,
+    затем читает актуальные ACL/role_permission и публикует изменения.
+    Любая ACL/role mutation берёт exclusive lock той же строки до проверки/изменения grants.
+    Структурные mutations берут exclusive lock с начала TX и повышают authorization_revision.
+    Preflight move: лимит папок, depth и длина logical path вне TX; generation сверяется под lock.
+    При смене поколения — bounded retry/409; внутри TX разрешён только ограниченный atomic rewrite.
+    Нельзя публиковать новый parent раньше обновления всех tree_path или продолжать rewrite после COMMIT.
+    Для cross-space COPY строки source/destination space блокируются в порядке UUID.
+    После lock используется свежий READ COMMITTED snapshot; stale snapshot не подтверждает доступ.
+    Этот барьер защищает локальные ACL/роли, но не заменяет внешний membership refresh/expiry.
+    '/
+  }
+
+  ' Источник: sprut-file-manager-db-content.puml
+  package "Версии, загрузки и артефакты" as pkg_content #EBFBEE {
+    entity "file_version" as file_version #EBFBEE {
+      ' Допустимые значения колонок.
+      .. Допустимые значения ..
+      {field} origin = UPLOAD | CORRECTOR | JOB_ROLLBACK
+      {field} origin = TREE_RESTORE | COPY | VERSION_RESTORE
+      {field} status = STAGED | AVAILABLE | RETIRED
+      == Колонки ==
+      * id : UUID <<PK>> [ID версии содержимого файла]
+      --
+      * file_node_id : UUID <<FK>> [Файл, которому принадлежит версия]
+      ' Монотонный номер; номера удалённых версий не переиспользуются.
+      * version_number : BIGINT [Монотонный номер версии файла; не переиспользуется]
+      ' Несколько версий могут ссылаться на одни байты при restore/copy.
+      * content_object_id : UUID <<FK>> [Объект байтов; может переиспользоваться другими версиями]
+      ' Логический ID исходной версии без FK: история может быть очищена.
+      source_version_id : UUID [Исходная версия при copy или restore; без FK]
+      ' UPLOAD / CORRECTOR / JOB_ROLLBACK / TREE_RESTORE / COPY / VERSION_RESTORE.
+      * origin : VARCHAR(32) [Способ появления версии; допустимые значения выше]
+      ' Логические ID для аудита, не блокируют удаление job/item.
+      operation_id : UUID [Создавшая версию операция; логическая ссылка без FK]
+      item_id : UUID [Создавшая версию пофайловая работа; без FK]
+      * content_type : VARCHAR(255) [MIME-тип содержимого этой версии]
+      charset_name : VARCHAR(64) [Кодировка текста; NULL если не определена]
+      ' STAGED / AVAILABLE / RETIRED; RETIRED запрещён для новых работ.
+      * status : VARCHAR(32) [Состояние версии: подготовлена, доступна или выведена]
+      created_by : UUID [Пользователь или сервис, создавший запись]
+      * created_at : TIMESTAMPTZ [Время создания записи]
+      activated_at : TIMESTAMPTZ [Время публикации версии; NULL до публикации]
+      retired_at : TIMESTAMPTZ [Время вывода версии из доступных; NULL до retirement]
+    }
+
+    entity "content_object" as content_object #EBFBEE {
+      ' Допустимые значения колонок.
+      .. Допустимые значения ..
+      {field} status = RESERVED | AVAILABLE | GC_PENDING | DELETED
+      == Колонки ==
+      ' Один неизменяемый объект; GC учитывает все ссылающиеся версии.
+      * id : UUID <<PK>> [ID физического неизменяемого объекта]
+      --
+      * space_id : UUID <<FK>> [Файловое пространство, которому принадлежит запись]
+      ' storage_space.key_prefix + objects/{objectId}; без логических имён/папок.
+      * object_key : VARCHAR(1024) [S3 key объекта; не содержит логических имён или путей]
+      ' Если native versioning включён, удаляется точная provider-версия.
+      provider_version_id : VARCHAR(1024) [Точный ID версии S3; NULL без native versioning]
+      ' NULL допустим только до verify, обязательны для AVAILABLE.
+      checksum_sha256 : CHAR(64) [SHA-256 байтов; NULL допустим до проверки загрузки]
+      size_bytes : BIGINT [Размер байтов; NULL допустим до проверки загрузки]
+      ' RESERVED / AVAILABLE / GC_PENDING / DELETED.
+      * status : VARCHAR(32) [Состояние объекта от резервирования до удаления]
+      * created_at : TIMESTAMPTZ [Время создания записи]
+      verified_at : TIMESTAMPTZ [Время проверки размера и checksum]
+      ' Пауза перед удалением для recovery/reconciliation.
+      delete_not_before : TIMESTAMPTZ [Самый ранний срок физического удаления после grace]
+      deleted_at : TIMESTAMPTZ [Время подтверждённого удаления объекта]
+    }
+
+    entity "upload_session" as upload_session #E7F5FF {
+      ' Допустимые значения колонок.
+      .. Допустимые значения ..
+      {field} status [active] = INITIATED | UPLOADING | VERIFYING
+      {field} status [terminal] = COMPLETED | ABORTED | EXPIRED | FAILED
+      == Колонки ==
+      * id : UUID <<PK>> [ID сессии загрузки и идемпотентной финализации]
+      --
+      * space_id : UUID <<FK>> [Файловое пространство, которому принадлежит запись]
+      ' Для нового файла обязательна папка назначения.
+      target_parent_id : UUID <<FK>> [Папка назначения при создании нового файла]
+      ' Для update указывается стабильный ID файла.
+      file_node_id : UUID <<FK>> [Существующий файл при обновлении содержимого]
+      base_version_id : UUID <<FK>> [Версия файла, на основе которой начат upload]
+      expected_content_revision : BIGINT [Ожидаемый номер содержимого для CAS при finalize]
+      requested_name : VARCHAR(255) [Имя создаваемого файла; используется вместе с папкой]
+      * content_type : VARCHAR(255) [MIME-тип будущей версии; фиксируется до передачи байтов]
+      charset_name : VARCHAR(64) [Кодировка текста; NULL для бинарных или неопределённых данных]
+      * revision : BIGINT [CAS состояния сессии и выбора текущей попытки]
+      current_attempt_id : UUID <<FK>> [Текущая попытка этой сессии; NULL до первого claim]
+      result_version_id : UUID <<FK>> [Опубликованная версия; NULL до успешного finalize]
+      expected_size_bytes : BIGINT [Заявленный размер; NULL для потока заранее неизвестной длины]
+      expected_checksum_sha256 : CHAR(64) [Заявленный SHA-256 для проверки целостности]
+      ' INITIATED / UPLOADING / VERIFYING / COMPLETED / ABORTED / EXPIRED / FAILED.
+      * status : VARCHAR(32) [Состояние загрузки и её финализации]
+      * created_by : UUID [Пользователь или сервис, создавший запись]
+      * created_at : TIMESTAMPTZ [Время создания записи]
+      * expires_at : TIMESTAMPTZ [Срок жизни сессии; после истечения finalize запрещён]
+      completed_at : TIMESTAMPTZ [Время успешного finalize и публикации версии]
+      last_error_code : VARCHAR(64) [Машиночитаемый код последней ошибки]
+    }
+
+    entity "upload_attempt" as upload_attempt #E7F5FF {
+      .. Допустимые значения ..
+      {field} status [active] = RESERVED | UPLOADING | UPLOADED | VERIFYING
+      {field} status [terminal] = VERIFIED | FAILED | ABORTED | EXPIRED
+      == Колонки ==
+      * id : UUID <<PK>> [ID одной попытки передачи байтов; не ID пользовательской команды]
+      --
+      * upload_session_id : UUID <<FK>> [Сессия, которой принадлежит попытка]
+      * attempt_number : INTEGER [Монотонный номер новой попытки внутри сессии]
+      * content_object_id : UUID <<FK>> [Отдельный immutable object key этой попытки]
+      provider_upload_id : VARCHAR(1024) [ID текущего S3 multipart; NULL до создания или без multipart]
+      * status : VARCHAR(16) [Состояние передачи и проверки конкретной попытки]
+      lease_owner : VARCHAR(128) [Worker или HTTP writer, владеющий попыткой]
+      lease_until : TIMESTAMPTZ [Срок права writer обновлять попытку]
+      * lease_token : BIGINT [Fencing номер claim; проверяется вместе с current_attempt_id]
+      * uploaded_bytes : BIGINT [Последний durable snapshot числа переданных байтов; не checksum receipt]
+      progress_updated_at : TIMESTAMPTZ [Время durable snapshot прогресса; NULL до первой записи]
+      uploaded_at : TIMESTAMPTZ [Время получения полного object receipt; NULL до завершения I/O]
+      * created_at : TIMESTAMPTZ [Время резервирования попытки и её object key]
+      finished_at : TIMESTAMPTZ [Время завершения или прекращения этой попытки]
+      last_error_code : VARCHAR(64) [Безопасный код ошибки передачи или проверки]
+    }
+
+    entity "export_artifact" as export_artifact #FFF9DB {
+      .. Допустимые значения ..
+      {field} format = ZIP
+      {field} status = PLANNED | BUILDING | READY | FAILED | EXPIRED
+      == Колонки ==
+      * id : UUID <<PK>> [ID готовящегося архива; не файловый узел пользовательского дерева]
+      --
+      * job_id : UUID <<FK>> [Единственное EXPORT-задание, создающее этот артефакт]
+      * space_id : UUID <<FK>> [Пространство размещения архива и граница доступа]
+      content_object_id : UUID <<FK>> [Объект текущей попытки сборки; NULL до резервирования]
+      * format : VARCHAR(16) [Формат артефакта; в текущем контракте только ZIP]
+      * archive_name : VARCHAR(255) [Безопасное имя скачиваемого архива без пути]
+      * status : VARCHAR(16) [Состояние сборки и доступности артефакта]
+      * revision : BIGINT [CAS смены объекта, состояния и завершения сборки]
+      * attempt : INTEGER [Число начатых попыток полной сборки архива]
+      lease_owner : VARCHAR(128) [Worker, собирающий архив]
+      lease_until : TIMESTAMPTZ [Срок права worker завершить текущую сборку]
+      * lease_token : BIGINT [Fencing номер сборки; старый worker не публикует READY]
+      provider_upload_id : VARCHAR(1024) [Multipart ID текущей сборки для recovery и abort]
+      * next_attempt_at : TIMESTAMPTZ [Не раньше этого времени разрешён повтор сборки]
+      * expires_at : TIMESTAMPTZ [Предельный срок доступности артефакта и его manifest]
+      read_protected_until : TIMESTAMPTZ [До какого deadline GC сохраняет объект для начатого bounded download]
+      * created_at : TIMESTAMPTZ [Время регистрации артефакта]
+      ready_at : TIMESTAMPTZ [Время атомарной публикации проверенного ZIP]
+      last_error_code : VARCHAR(64) [Безопасный код ошибки сборки архива]
+    }
+
+    /' note bottom of file_version
+    UNIQUE(file_node_id, version_number).
+    current_version_id принадлежит тому же file_node_id.
+    Байты версии неизменяемы; меняется только GC lifecycle.
+    Restore создаёт новую file_version, переиспользуя content_object.
+    Нет новой версии, если результат корректора идентичен исходным байтам.
+    UNIQUE(item_id) WHERE item_id IS NOT NULL AND activated_at IS NOT NULL: один опубликованный результат.
+    VERSION_RESTORE создаёт новую версию, не переключает pointer на старую запись.
+    Source version ID — происхождение; живые base/target/source защищаются holds.
+    '/
+
+    /' note bottom of upload_session
+    revision >= 1; expected_size_bytes IS NULL OR expected_size_bytes >= 0.
+    NEW: target_parent_id + requested_name; file_node_id/base/revision содержимого NULL.
+    UPDATE: file_node_id + expected_content_revision; target_parent_id/requested_name NULL.
+    UPDATE пустого placeholder допускает base_version_id=NULL и content_revision=0.
+    target space и file/base version принадлежат одной границе размещения.
+    Composite FK (id,current_attempt_id) -> upload_attempt(upload_session_id,id).
+    result_version_id UNIQUE при наличии; COMPLETED требует опубликованный результат.
+    S3 I/O вне DB транзакции.
+    Finalize проверяет active session, expires_at, current_attempt и VERIFIED receipt.
+    NEW finalize берёт exclusive space lock и повышает authorization_revision; UPDATE — shared lock.
+    Verify + CAS -> версия + current pointer + node_revision
+    + audit + search_index_task в одной короткой транзакции.
+    Retry complete возвращает result_version_id, не перепубликует старую версию.
+    Фактический размер измеряется даже при expected_size_bytes=NULL; byte limit обязателен.
+    Cleanup terminal session: очистить current pointer, затем attempts и session по retention.
+    '/
+
+    /' note bottom of upload_attempt
+    UNIQUE(upload_session_id,attempt_number); UNIQUE(upload_session_id,id).
+    UNIQUE(content_object_id); attempt_number >= 1; lease_token >= 1; uploaded_bytes >= 0.
+    Новая попытка = новый content_object/key; не перезаписывать объект старой попытки.
+    VERIFIED требует content_object AVAILABLE с размером/checksum/provider receipt.
+    Все commit проверяют lease/token и current_attempt_id родительской session.
+    Истёкший writer не получает право публикации даже после успешного S3 I/O.
+    Новый attempt регистрируется и выбирается в session одной короткой TX.
+    Старый multipart ID сохраняется до подтверждённого abort/reconciliation.
+    Lease не останавливает удалённый I/O; bounded timeout и orphan sweep обязательны.
+    Uploaded bytes — прогресс, не доказательство целостности; SHA-256 в content_object.
+    '/
+
+    /' note bottom of export_artifact
+    UNIQUE(job_id); job_type=EXPORT и artifact.space_id=job.space_id.
+    UNIQUE(content_object_id) WHERE content_object_id IS NOT NULL.
+    Каждый повтор сборки резервирует новый content_object/key и новый lease token.
+    До смены pointer старый multipart регистрируется как ABORT_MULTIPART gc_task.
+    target_id abort-задачи = ID объекта этой сборки, не повторно используемый artifact.id.
+    Старый объект не исчезает из recovery: RESERVED candidates учитывает orphan sweep.
+    Переход READY требует AVAILABLE object с размером/checksum, ready_at и ещё не истёкшим expires_at.
+    CAS READY проверяет lease/token, cancellation и полноту EXPORT_ENTRY manifest.
+    Manifest хранится в bulk_change_item: source version + archive_entry_path.
+    Failed build не выдаётся как полный ZIP; повтор строит весь архив заново.
+    Download повторно проверяет ACL источников и TTL; signed URL не живёт дольше expires_at.
+    READY до expires_at является самостоятельной живой ссылкой на content_object.
+    Manifest и source holds сохраняются до expiry с учётом активного чтения.
+    Перед выдачей stream короткая TX продлевает read_protected_until под row lock объекта/артефакта.
+    Поток ограничен deadline; продление выполняется до его истечения, иначе чтение прекращается.
+    Потеря процесса не оставляет вечный read pin: защита истекает по bounded deadline.
+    Проверка ACL большого manifest постраничная, не одна длинная TX на все записи.
+    Проверка охватывает стабильную storage_space.authorization_revision; при смене повтор/отказ.
+    Финальный admission берёт shared lock space, сверяет revision и фиксирует read pin в короткой TX.
+    Claim INDEX(next_attempt_at,id) для PLANNED/FAILED; INDEX(lease_until) для BUILDING.
+    Claim требует активный EXPORT job, неистёкший deadline и оставшийся retry budget.
+    revision >= 1; attempt >= 0; lease_token >= 0; формат ZIP; archive_name не содержит пути.
+    Cleanup job/items не удаляет manifest живого артефакта.
+    '/
+
+    /' note bottom of content_object
+    UNIQUE(space_id, object_key); CHECK(size_bytes >= 0).
+    GC_PENDING запрещает создание новых ссылок.
+    Создание ссылки и начало GC сериализуются row lock объекта.
+    GC учитывает file_version, живые upload_attempt и artifact с действующим TTL/read pin.
+    RESERVED не читается как опубликованный файл; AVAILABLE требует size/checksum/verified_at.
+    Переиспользование объекта не означает дедупликацию по checksum.
+    Native S3 versioning опционален, с ограниченным lifecycle.
+    '/
+  }
+
+  ' Источник: sprut-file-manager-db-bulk.puml
+  package "Массовые задания и discovery" as pkg_bulk #FFF9DB {
+    entity "corrector_rule_set" as corrector_rule_set {
+      ' Допустимые значения колонок.
+      .. Допустимые значения ..
+      {field} status = ACTIVE | ARCHIVED
+      == Колонки ==
+      * id : UUID <<PK>> [ID набора правил с независимыми версиями]
+      --
+      * space_id : UUID <<FK>> [Файловое пространство, которому принадлежит запись]
+      * name : VARCHAR(255) [Отображаемое имя набора правил]
+      ' ACTIVE / ARCHIVED; архивирование не меняет выполняющийся job.
+      * status : VARCHAR(16) [Набор доступен для запуска или архивирован]
+      * revision : BIGINT [CAS имени и архивирования набора; не номер immutable версии правил]
+      * created_by : UUID [Пользователь или сервис, создавший запись]
+      * created_at : TIMESTAMPTZ [Время создания записи]
+      * updated_at : TIMESTAMPTZ [Время последнего изменения записи]
+    }
+
+    entity "corrector_rule_version" as corrector_rule_version {
+      ' Допустимые значения колонок.
+      .. Допустимые значения ..
+      {field} corrector_type [built-in] = TXT_REGULAR | TEST_JSON | PARAMETRIZATION
+      {field} corrector_type [extension] = ID зарегистрированного plugin
+      == Колонки ==
+      * id : UUID <<PK>> [ID неизменяемой версии правил]
+      --
+      * rule_set_id : UUID <<FK>> [Набор правил, которому принадлежит версия]
+      * version_number : BIGINT [Номер версии внутри набора правил]
+      ' TXT_REGULAR / TEST_JSON / PARAMETRIZATION / зарегистрированный plugin.
+      * corrector_type : VARCHAR(64) [Встроенный корректор или ID разрешённого plugin]
+      ' Immutable описание фильтров, выражений и замен.
+      * definition : JSONB [Неизменяемые фильтры, выражения и параметры замен]
+      * definition_hash : CHAR(64) [SHA-256 канонического описания правил]
+      ' Валидированный движок/DSL, не произвольный исполняемый код.
+      * engine_version : VARCHAR(64) [Версия движка или DSL для воспроизводимого выполнения]
+      * created_by : UUID [Пользователь или сервис, создавший запись]
+      * created_at : TIMESTAMPTZ [Время создания записи]
+    }
+
+    entity "bulk_change_job" as bulk_change_job {
+      ' Допустимые значения колонок.
+      .. Допустимые значения ..
+      {field} job_type = CORRECTOR | JOB_ROLLBACK | TREE_RESTORE
+      {field} job_type = COPY | DELETE | EXPORT | VERSION_RETIREMENT
+      {field} status [active] = QUEUED | RUNNING | CANCEL_REQUESTED | FINALIZING
+      {field} status [terminal] = COMPLETED | COMPLETED_WITH_ERRORS
+      {field} status [terminal] = CANCELLED | FAILED
+      {field} discovery_status = PENDING | RUNNING | COMPLETE | CANCELLED | FAILED
+      {field} conflict_policy = SKIP_AND_REPORT
+      {field} actor_type = USER | SERVICE
+      {field} cancel_mode = STOP | STOP_AND_ROLLBACK
+      == Колонки ==
+      * id : UUID <<PK>> [ID длительного задания изменения, экспорта или восстановления]
+      --
+      * space_id : UUID <<FK>> [Файловое пространство, которому принадлежит запись]
+      ' Типизированная команда; перечень допустимых видов приведён выше.
+      * job_type : VARCHAR(32) [Вид массовой операции; определяет manifest и доступные действия]
+      rule_version_id : UUID <<FK>> [Версия правил; NULL для других операций или после cleanup]
+      ' Полный immutable snapshot правил/параметров, независим от шаблона.
+      * command_snapshot : JSONB [Самодостаточный неизменяемый снимок команды и параметров]
+      * command_hash : CHAR(64) [SHA-256 канонического снимка команды]
+      ' Только JOB_ROLLBACK; исходный job удерживается до завершения компенсации.
+      source_job_id : UUID <<FK>> [Исходное задание, изменения которого компенсируются]
+      retry_of_job_id : UUID <<FK>> [Исходное задание для нового запуска subset; не ссылка компенсации]
+      rollback_job_id : UUID <<FK>> [Единственная автоматическая компенсация принятого cancel-намерения]
+      ' Только TREE_RESTORE: T внутри доступного окна.
+      restore_to : TIMESTAMPTZ [Момент T для TREE_RESTORE; NULL для других заданий]
+      ' QUEUED / RUNNING / CANCEL_REQUESTED / FINALIZING /
+      ' COMPLETED / COMPLETED_WITH_ERRORS / CANCELLED / FAILED.
+      * status : VARCHAR(32) [Состояние выполнения и финализации задания]
+      ' PENDING / RUNNING / COMPLETE / CANCELLED / FAILED.
+      * discovery_status : VARCHAR(16) [Состояние обнаружения и постановки элементов в очередь]
+      ' Default SKIP_AND_REPORT; не last-writer-wins.
+      * conflict_policy : VARCHAR(32) [Политика CAS-конфликтов: пропустить и сообщить]
+      ' Лимит активных items одного job.
+      * max_parallel_items : INTEGER [Максимум одновременно выполняемых работ этого задания]
+      discovery_lease_owner : VARCHAR(128) [Worker, временно владеющий обходом целей]
+      discovery_lease_until : TIMESTAMPTZ [Срок права worker продолжать discovery]
+      * discovery_lease_token : BIGINT [Номер захвата discovery; отсекает устаревшего worker]
+      ' Кэш счётчиков, не источник истины/барьер завершения.
+      * progress_snapshot : JSONB [Кэш прогресса; не источник истины и не барьер завершения]
+      * actor_type : VARCHAR(16) [Инициатор USER или SERVICE; соответствует created_by]
+      * caller_id : VARCHAR(255) [Аутентифицированная workload identity вызывающего сервиса]
+      * correlation_id : VARCHAR(128) [Correlation ID исходной команды; не ключ идемпотентности]
+      trace_context : JSONB [Разрешённые traceparent/tracestate; без токенов и произвольного baggage]
+      * authorization_context : JSONB [Источник identity и контекст проверки; не бессрочный snapshot прав]
+      * created_by : UUID [Пользователь или сервис, создавший запись]
+      * created_at : TIMESTAMPTZ [Время создания записи]
+      started_at : TIMESTAMPTZ [Время начала выполнения]
+      discovery_finished_at : TIMESTAMPTZ [Время завершения формирования списка работ]
+      cancel_requested_at : TIMESTAMPTZ [Время принятия отмены; NULL до запроса cancel]
+      cancel_mode : VARCHAR(32) [STOP либо STOP_AND_ROLLBACK; NULL пока отмена не запрошена]
+      finished_at : TIMESTAMPTZ [Время перехода в конечное состояние]
+      ' Срок удержания base/result и деталей для компенсации.
+      rollback_available_until : TIMESTAMPTZ [До какого времени доступны версии и детали для rollback]
+      last_error_code : VARCHAR(64) [Машиночитаемый код последней ошибки]
+    }
+
+    entity "bulk_change_scope" as bulk_change_scope {
+      ' Допустимые значения колонок.
+      .. Допустимые значения ..
+      {field} scope_type = ROOT | EXCLUDE
+      == Колонки ==
+      * job_id : UUID <<PK,FK>> [Задание, для которого задана область; компонент PK]
+      ' Stable ID без FK: restore нужен ID уже удалённого узла.
+      * node_id : UUID <<PK>> [ID корня или исключённого узла, без FK; компонент PK]
+      ' ROOT / EXCLUDE.
+      * scope_type : VARCHAR(16) <<PK>> [Корень обхода или исключение; компонент PK]
+      --
+      ' Только отображение/аудит, не идентификатор цели.
+      display_path_snapshot : TEXT [Путь для отображения и аудита; не ID цели]
+    }
+
+    entity "bulk_discovery_cursor" as bulk_discovery_cursor {
+      ' Допустимые значения колонок.
+      .. Допустимые значения ..
+      {field} status = PENDING | SCANNING | COMPLETE
+      == Колонки ==
+      * job_id : UUID <<PK,FK>> [Задание обхода; компонент составного PK]
+      * folder_node_id : UUID <<PK>> [Обходимая папка; компонент составного PK]
+      --
+      ' PENDING / SCANNING / COMPLETE.
+      * status : VARCHAR(16) [Состояние постраничного обхода этой папки]
+      ' Keyset по стабильному id, не OFFSET/имени.
+      last_child_node_id : UUID [Последний обработанный ребёнок; NULL до первой страницы]
+      * updated_at : TIMESTAMPTZ [Время последнего изменения записи]
+    }
+
+    entity "bulk_change_item" as bulk_change_item {
+      ' Допустимые значения колонок.
+      .. Допустимые значения ..
+      {field} operation = TRANSFORM_CONTENT | RESTORE_NODE | TRASH_NODE
+      {field} operation = COPY_NODE | COPY_CONTENT | EXPORT_ENTRY | PURGE_NODE | RETIRE_VERSION
+      {field} status [active] = WAITING_DEPENDENCY | PENDING | RUNNING | RETRY
+      {field} status [terminal] = SUCCEEDED | UNCHANGED | CONFLICT | FAILED | CANCELLED
+      == Колонки ==
+      * id : UUID <<PK>> [ID отдельной пофайловой работы]
+      --
+      * job_id : UUID <<FK>> [Задание, которому принадлежит запись]
+      ' Stable ID, включая tombstone; логическая ссылка без FK.
+      * node_id : UUID [ID цели; для COPY_NODE выделяется при discovery, для EXPORT_ENTRY — источник]
+      * operation : VARCHAR(32) [Типизированное действие; обязательные поля проверяются по operation]
+      source_node_id : UUID [Узел источника COPY; логический ID без FK для retention]
+      source_space_id : UUID <<FK>> [Пространство источника COPY; может отличаться от job.space_id]
+      source_version_id : UUID <<FK>> [Зафиксированная версия источника COPY; NULL для папки]
+      target_parent_id : UUID [Папка назначения COPY_NODE; логический ID, включая ещё не созданную копию]
+      target_name : VARCHAR(255) [Имя создаваемого узла COPY_NODE]
+      archive_entry_path : TEXT [Уникальный безопасный относительный путь записи ZIP; только EXPORT_ENTRY]
+      ' Снимок при discovery; NULL для папки.
+      base_version_id : UUID <<FK>> [Версия на момент discovery; NULL для папки]
+      expected_content_revision : BIGINT [Ожидаемый номер содержимого перед публикацией; CAS]
+      ' CAS структуры только для операций над структурой.
+      expected_node_revision : BIGINT [Ожидаемый номер metadata перед структурной операцией]
+      ' Желаемые name/parent/status для restore.
+      target_state : JSONB [Целевые parent, name и status для восстановления узла]
+      before_state : JSONB [Минимальные metadata до изменения; признак отсутствия узла для новой копии]
+      target_version_id : UUID <<FK>> [Версия для RESTORE_NODE, EXPORT_ENTRY либо RETIRE_VERSION]
+      ' Результат upload для retry после сбоя.
+      staged_version_id : UUID <<FK>> [Подготовленная версия для безопасного повтора после сбоя]
+      result_version_id : UUID <<FK>> [Версия, опубликованная этой работой]
+      ' Состояние структуры после commit; нужно для CAS её компенсации.
+      result_node_revision : BIGINT [Номер metadata после commit; CAS при компенсации]
+      result_content_revision : BIGINT [Номер содержимого после commit; CAS для компенсации байтов]
+      ' Исходный item компенсации; SET NULL только после безопасного retention.
+      source_item_id : UUID <<FK>> [Исходная работа, изменения которой компенсируются]
+      retry_of_item_id : UUID <<FK>> [Элемент исходного job, повторяемый новым subset-запуском]
+      ' WAITING_DEPENDENCY / PENDING / RUNNING / RETRY /
+      ' SUCCEEDED / UNCHANGED / CONFLICT / FAILED / CANCELLED.
+      * status : VARCHAR(32) [Состояние выполнения и пофайловый итог]
+      * attempt : INTEGER [Счётчик попыток выполнения, включая повторы]
+      * next_attempt_at : TIMESTAMPTZ [Не раньше этого времени разрешена следующая попытка]
+      lease_owner : VARCHAR(128) [Worker, временно получивший задачу в обработку]
+      lease_until : TIMESTAMPTZ [Срок действия права worker на обработку задачи]
+      ' Растёт при claim; старый worker не сможет выполнить commit.
+      * lease_token : BIGINT [Номер захвата; запрещает commit устаревшего worker]
+      * processed_bytes : BIGINT [Счётчик обработанных байтов для прогресса работы]
+      error_code : VARCHAR(64) [Машиночитаемый код последней ошибки]
+      ' Ограниченная/очищенная ошибка без содержимого и секретов.
+      error_message : TEXT [Безопасное описание ошибки; без содержимого и секретов]
+      * created_at : TIMESTAMPTZ [Время создания записи]
+      started_at : TIMESTAMPTZ [Время начала обработки пофайловой работы]
+      finished_at : TIMESTAMPTZ [Время перехода в конечное состояние]
+    }
+
+    entity "bulk_item_dependency" as bulk_item_dependency {
+      * item_id : UUID <<PK,FK>> [Зависимая работа, ожидающая prerequisite; компонент PK]
+      * depends_on_item_id : UUID <<PK,FK>> [Работа, которая должна завершиться раньше; компонент PK]
+      --
+      ' DAG: родитель до ребёнка; удаления в обратном порядке.
+      ' Ошибка prerequisite терминально завершает dependent item.
+    }
+
+    /' note bottom of bulk_discovery_cursor
+    Страница items + child cursors + checkpoint пишутся одной TX.
+    Пересекающиеся ROOT нормализуются.
+    UNIQUE(job_id,node_id,operation) WHERE operation <> 'RETIRE_VERSION'.
+    UNIQUE(job_id,target_version_id) WHERE operation='RETIRE_VERSION'.
+    UNIQUE(job_id,source_node_id) WHERE operation='COPY_NODE'.
+    COPY_NODE заранее получает target node_id; повтор discovery находит тот же item/ID.
+    Child copy item ссылается на выделенный target parent ID и ждёт parent dependency.
+    Для COPY разные source spaces имеют раздельные source holds и ACL.
+    Discovery не собирает все пути в RAM.
+    Current scope и нормализация ROOT/EXCLUDE используют ltree папок; FILE — JOIN на parent.
+    Иерархия на T строится из исторических parent_node_id, не текущего tree_path.
+    Снимок пофайловый при обнаружении, не глобальный на момент старта.
+    Новые/перемещённые во время обхода файлы могут не попасть в job.
+    '/
+
+    /' note bottom of bulk_change_item
+    Claim: TX SELECT FOR UPDATE SKIP LOCKED + lease/token, COMMIT.
+    S3/transform вне TX; heartbeat продлевает только свой lease/token.
+    Commit проверяет lease/token, base version и content_revision.
+    Для структуры — expected_node_revision; CONFLICT не затирает файл.
+    COPY_CONTENT: source_version_id — источник, base_version_id — старая версия назначения.
+    COPY_CONTENT сохраняет node_id назначения и публикует новую file_version origin=COPY.
+    COPY_NODE создаёт новый node_id; папка и FILE имеют разные требования к version fields.
+    Новая FOLDER: tree_path = destination parent.tree_path || label(node_id); FILE: NULL.
+    Prefix источника не переносится; путь вычисляется под structural space lock.
+    same-space COPY может разделять immutable object; cross-space создаёт отдельное размещение.
+    source version принадлежит source node/space; base/result относятся к node_id/job.space_id.
+    target parent находится в destination space; циклы и собственное поддерево запрещены.
+    COPY_NODE требует source_node_id/source_space_id/target_parent_id/target_name/before_state.
+    COPY FILE требует source_version_id; COPY FOLDER не имеет content source version.
+    EXPORT_ENTRY: node_id — исходный узел job.space_id, target_version_id — manifest version.
+    EXPORT_ENTRY требует archive_entry_path; абсолютные пути, '..' и дубли запрещены.
+    UNIQUE(job_id,archive_entry_path) WHERE operation='EXPORT_ENTRY'; лимиты пути проверяются.
+    EXPORT_ENTRY success не завершает job: нужен export_artifact READY и полный manifest.
+    RETIRE_VERSION требует target_version_id этого node_id; current/holds/retention не обходятся.
+    PURGE_NODE не означает немедленное удаление S3: проверяются history/holds и durable gc_task.
+    before_state типизирован по operation; содержит metadata, но не байты и не копию дерева.
+    retry_of_item_id принадлежит retry_of_job_id; source_item_id принадлежит source_job_id.
+    UNIQUE(job_id,retry_of_item_id) WHERE retry_of_item_id IS NOT NULL.
+    Commit атомарен: current pointer + node_revision + item + audit + index task.
+    Контентная публикация — shared space lock; структурная — exclusive с начала TX.
+    COPY_NODE/TRASH/RESTORE/PURGE повышают authorization_revision при изменении namespace.
+    Retry не создаёт повторно опубликованную версию.
+    INDEX(next_attempt_at,id) WHERE status IN ('PENDING','RETRY').
+    INDEX(lease_until) WHERE status='RUNNING'; INDEX(job_id,status).
+    Claim учитывает job status; лимит параллелизма резервируется атомарно.
+    CHECK attempt >= 0, lease_token >= 0, processed_bytes >= 0.
+    '/
+
+    /' note bottom of bulk_change_job
+    Запуск без подтверждения; пересекающиеся roots разрешены.
+    actor_type = USER | SERVICE. correlation_id сохраняется атомарно с job.
+    Worker проверяет текущие ACL, ACTIVE роли и актуальность внешнего назначения.
+    Истёкший/непроверяемый identity-контекст запрещает публикацию (fail closed).
+    Обновление membership/делегирования требует отдельного доверенного протокола.
+    Worker commit берёт shared lock job и проверяет RUNNING.
+    Cancel берёт exclusive lock и ставит CANCEL_REQUESTED:
+    после commit cancel новые изменения больше не публикуются.
+    STOP сохраняет уже опубликованные изменения.
+    STOP_AND_ROLLBACK сохраняет durable intent; компенсация — отдельное задание.
+    CHECK cancel_mode IS NULL ровно когда cancel_requested_at IS NULL.
+    Принятый cancel_mode неизменяем; повтор того же mode идемпотентен, другой — конфликт.
+    Finalizer/reconciler после остановки создаёт JOB_ROLLBACK и записывает rollback_job_id
+    одной TX под exclusive lock исходного job; повтор использует существующую связь.
+    UNIQUE(rollback_job_id) WHERE rollback_job_id IS NOT NULL; job не ссылается на себя.
+    Linked rollback.source_job_id = исходный job.id, общий space, тип JOB_ROLLBACK.
+    Ручные rollback не занимают поле автоматической компенсации cancel.
+    Если admission компенсации отложен, intent и holds сохраняются до запуска.
+    EXPORT, VERSION_RETIREMENT и DELETE/PURGE не допускают STOP_AND_ROLLBACK.
+    Сам JOB_ROLLBACK не создаёт бесконечную цепочку авто-компенсаций.
+    Finalizer: discovery COMPLETE + нет нетерминальных items,
+    атомарный RUNNING -> FINALIZING -> итоговый статус.
+    Cancel останавливает discovery, отменяет невыполненные items
+    и завершает leases; итог CANCELLED с частичным результатом.
+    FAILED discovery завершает job с учётом уже сделанных изменений.
+    Progress считается из items; кэш counters не барьер финализации.
+    CHECK max_parallel_items > 0; CHECK полей по job_type.
+    source_job_id только для JOB_ROLLBACK; retry_of_job_id не заменяет source_job_id.
+    Retry job имеет тот же job_type и space, новый immutable command_snapshot и actor context.
+    EXPORT не допускает subset retry: повтор сборки использует полный исходный manifest.
+    Связи retry/source не образуют циклов; cleanup не разрывает живую компенсацию.
+    Для VERSION_RETIREMENT command snapshot содержит bounded selection версий, не raw S3 keys.
+    Для COPY job.space_id — destination; source spaces явно указаны в items/command snapshot.
+    Для EXPORT terminal success требует READY artifact, а не только terminal items.
+    INDEX(retry_of_job_id), INDEX(source_job_id); retention учитывает связанные live jobs.
+    corrector_rule_set.revision >= 1; CAS UPDATE revision=expected, revision=revision+1.
+    UNIQUE(rule_set_id,version_number) у corrector_rule_version.
+    У rule_version_id ON DELETE SET NULL: command_snapshot самодостаточен.
+    '/
+
+    /' note right of bulk_item_dependency
+    JOB_ROLLBACK берёт исходные SUCCEEDED items.
+    Компенсация только если current version = исходный result_version;
+    также проверяются result_content_revision и metadata revision/состояние по операции.
+    COPY_NODE компенсация убирает только созданные job узлы без чужих изменений/children.
+    Dependencies компенсации обратные: children раньше parent; конфликт child защищает parent.
+    COPY_CONTENT восстанавливает base bytes новой версией; чужие последующие edits сохраняются.
+    Иначе ROLLBACK_CONFLICT.
+    TREE_RESTORE читает node_revision на T, создаёт новые состояния/версии.
+    Родители восстанавливаются первыми; история не удаляется.
+    tree_path вычисляется из текущего parent, в before_state исторический prefix не используется.
+    Структурный restore/rollback папки атомарно переписывает prefix её текущих вложенных папок.
+    При превышении maxAtomicMoveFolders — FAILED/RESOURCE_LIMIT_EXCEEDED без изменения структуры.
+    Move вне scope и коллизии имён возвращают CONFLICT.
+    '/
+  }
+
+  ' Источник: sprut-file-manager-db-retention.puml
+  package "Удержания и очистка" as pkg_retention #F3F0FF {
+    entity "retention_policy" as retention_policy #F3F0FF {
+      * id : UUID <<PK>> [ID политики хранения и очистки]
+      --
+      * tenant_id : UUID [Владелец данных; граница изоляции tenant]
+      * name : VARCHAR(255) [Отображаемое имя политики хранения]
+      ' Настраиваемые периоды; конкретные defaults определяются отдельно.
+      * version_retention_days : INTEGER [Сколько дней сохранять версии по возрасту]
+      * min_versions_per_file : INTEGER [Минимум последних версий, сохраняемых для файла]
+      * tree_restore_days : INTEGER [Глубина доступной истории для restore дерева, в днях]
+      * trash_retention_days : INTEGER [Срок хранения узлов в корзине, в днях]
+      * job_rollback_days : INTEGER [Окно компенсации задания, в днях]
+      * job_detail_retention_days : INTEGER [Срок хранения пофайловых деталей задания, в днях]
+      * job_summary_retention_days : INTEGER [Срок хранения сводки задания, в днях]
+      * audit_retention_days : INTEGER [Срок хранения событий аудита, в днях]
+      * gc_grace_hours : INTEGER [Пауза перед удалением объекта после допуска GC, в часах]
+      * orphan_grace_hours : INTEGER [Пауза перед очисткой бесхозной загрузки, в часах]
+      * updated_at : TIMESTAMPTZ [Время последнего изменения записи]
+    }
+
+    entity "version_hold" as version_hold #FFF9DB {
+      ' Допустимые значения колонок.
+      .. Допустимые значения ..
+      {field} holder_type = ACTIVE_JOB | JOB_ROLLBACK | RESTORE | INDEX_READ
+      {field} holder_type = USER_PIN | LEGAL_HOLD | SHARE | EXPORT
+      {field} holder_type = CONTENT_READ
+      == Колонки ==
+      * id : UUID <<PK>> [ID удержания версии от очистки]
+      --
+      * version_id : UUID <<FK>> [Версия, защищённая от retirement и GC]
+      ' ACTIVE_JOB / JOB_ROLLBACK / RESTORE / INDEX_READ / USER_PIN / LEGAL_HOLD / SHARE / EXPORT.
+      * holder_type : VARCHAR(32) [Тип причины или владельца удержания]
+      ' Job, пользователь, ссылка, export artifact или активный read.
+      * holder_id : UUID [ID durable владельца удержания; не только ID worker процесса]
+      * created_at : TIMESTAMPTZ [Время создания записи]
+      ' NULL = бессрочно; active job hold не истекает из-за падения worker.
+      expires_at : TIMESTAMPTZ [Срок удержания; NULL означает бессрочное]
+      ' Только устойчивое завершение/истечение доступности операции.
+      released_at : TIMESTAMPTZ [Время снятия удержания; NULL пока оно не снято]
+    }
+
+    entity "tree_history_hold" as tree_history_hold #FFF9DB {
+      ' Защищает историю на T во время длительного планирования restore.
+      * id : UUID <<PK>> [ID удержания истории пространства на момент T]
+      --
+      * space_id : UUID <<FK>> [Файловое пространство, которому принадлежит запись]
+      * job_id : UUID <<FK>> [Задание restore, ради которого удерживается история]
+      * restore_to : TIMESTAMPTZ [Защищённый момент T для построения и выполнения restore]
+      * created_at : TIMESTAMPTZ [Время создания записи]
+      ' До завершения планирования/выполнения; падение worker не освобождает hold.
+      released_at : TIMESTAMPTZ [Время снятия защиты; падение worker её не снимает]
+    }
+
+    entity "gc_task" as gc_task #E7F5FF {
+      ' Допустимые значения колонок.
+      .. Допустимые значения ..
+      {field} task_type = DELETE_OBJECT | ABORT_MULTIPART
+      {field} task_type = DELETE_LEGACY_SEARCH_DOCUMENT
+      {field} status = PENDING | RUNNING | RETRY | DONE | FAILED
+      == Колонки ==
+      * id : UUID <<PK>> [ID устойчивой задачи физической очистки]
+      --
+      * space_id : UUID <<FK>> [Файловое пространство, которому принадлежит запись]
+      ' DELETE_OBJECT / ABORT_MULTIPART / DELETE_LEGACY_SEARCH_DOCUMENT.
+      * task_type : VARCHAR(64) [Удаление объекта, отмена multipart или очистка legacy index]
+      ' Стабильный ID физической цели для дедупликации.
+      * target_id : UUID [Стабильный ID цели; участвует в дедупликации]
+      content_object_id : UUID <<FK>> [Связанный объект, если задача удаляет его байты]
+      ' Точная цель: key, provider_version_id, upload_id и т.п.; без секретов.
+      * target_snapshot : JSONB [Точная внешняя цель удаления; без credentials]
+      ' PENDING / RUNNING / RETRY / DONE / FAILED.
+      * status : VARCHAR(16) [Состояние выполнения физической очистки]
+      * delete_not_before : TIMESTAMPTZ [Не раньше этого срока разрешено физическое удаление]
+      * attempt : INTEGER [Счётчик попыток выполнения, включая повторы]
+      * next_attempt_at : TIMESTAMPTZ [Не раньше этого времени разрешена следующая попытка]
+      lease_owner : VARCHAR(128) [Worker, временно получивший задачу в обработку]
+      lease_until : TIMESTAMPTZ [Срок действия права worker на обработку задачи]
+      * lease_token : BIGINT [Номер захвата; запрещает commit устаревшего worker]
+      error_code : VARCHAR(64) [Машиночитаемый код последней ошибки]
+      * created_at : TIMESTAMPTZ [Время создания записи]
+      finished_at : TIMESTAMPTZ [Время перехода в конечное состояние]
+    }
+
+    /' note bottom of file_version
+    Версия сохраняется при ЛЮБОМ условии:
+    current pointer; последние N; возраст внутри retention;
+    active hold; STAGED upload/item; retained node_revision.
+    tree_history_hold сохраняет интервалы на T и их content versions.
+    История сохраняет интервалы окна restore и граничное состояние,
+    даже если исходная версия очень старая.
+    Возраст created_at сам по себе недостаточен для удаления.
+    Сначала очищаются expired references/holds,
+    затем AVAILABLE -> RETIRED; новые holds для RETIRED запрещены.
+    '/
+
+    /' note bottom of version_hold
+    UNIQUE(version_id,holder_type,holder_id) WHERE released_at IS NULL.
+    Hold и переход RETIRED сериализуются row lock версии.
+    Base/target/result удерживаются при discovery/commit в той же TX.
+    Terminal job удерживает base/result до rollback_available_until.
+    STOP_AND_ROLLBACK сохраняет holds при pending admission; lease/старое окно не снимают защиту.
+    При создании связанного rollback продление/передача holds выполняется той же TX.
+    COPY удерживает source/base/result; cross-space holds относятся к фактическим source versions.
+    EXPORT holder_id=artifact.id удерживает manifest versions до expiry и окончания read pin.
+    EXPORT holds бессрочны до устойчивого cleanup owner; освобождаются bounded batches.
+    CONTENT_READ: holder_id — ID чтения, expires_at — bounded deadline; renew до expiry либо stop I/O.
+    Direct read удерживает immutable version до закрытия stream; crash освобождается по deadline.
+    Reconciler снимает abandoned holds по устойчивому состоянию владельца.
+    Lease worker не заменяет hold.
+    Запуск rollback атомарно проверяет доступность исходного job
+    и переносит/продлевает необходимые holds на новое задание.
+    '/
+
+    /' note bottom of tree_history_hold
+    UNIQUE(job_id) WHERE released_at IS NULL.
+    Создание restore job + проверка watermark + hold атомарны.
+    Эта TX и сдвиг watermark сериализуются lock строки space.
+    Пока restore строит manifest, GC сохраняет состояние space на T.
+    После discovery версии дополнительно удерживаются пофайлово.
+    '/
+
+    /' note bottom of gc_task
+    UNIQUE(space_id,task_type,target_id).
+    SKIP LOCKED + lease/token; физическое удаление вне TX.
+    RETIRED version не даёт права удалить общий content_object:
+    отсутствие ВСЕХ STAGED/AVAILABLE file versions проверяется под row lock объекта.
+    Дополнительно проверяются active/verified upload attempts живой session и export artifacts.
+    BUILDING/READY artifact защищает current object при действующем lifecycle/lease/read.
+    Истёкший artifact сохраняет объект/manifest до read_protected_until.
+    Admission read pin и начало GC сериализуются row lock content_object и artifact.
+    Deadline ограничен сервером; stream завершается/продлевает pin до его истечения.
+    Crash reader задерживает cleanup только до bounded deadline, не создаёт вечный hold.
+    Новые object references и READY/VERIFIED переходы запрещены после GC_PENDING.
+    Одна TX: object -> GC_PENDING и INSERT gc_task.
+    После grace удаляем точную цель; NotFound = успех.
+    Затем object -> DELETED; после этого purge metadata.
+    RETIRED row можно удалить раньше, если object жив через другие версии.
+    Сбой между delete и DB commit безопасен: повторяем ту же задачу.
+    FK job/upload/history/attempt/artifact очищаются после завершения и безопасного retention.
+    Cleanup attempts сначала убирает session.current_attempt_id; result replay хранится до expiry.
+    Новый upload attempt не переиспользует старый object key; orphan sweep учитывает все попытки.
+    Multipart abort имеет точный provider_upload_id и durable gc_task до очистки попытки.
+    Late external write не считается отменённым по lease: bounded I/O, abort и reconciliation обязательны.
+    '/
+
+    /' note bottom of storage_space
+    T раньше restore_available_from -> RESTORE_POINT_EXPIRED.
+    Watermark и cleanup меняются согласованно.
+    Trash purge учитывает окно restore, descendants и holds.
+    Детали job очищаются после rollback/detail retention и завершения связанных live jobs,
+    summary хранится дольше; audit не содержит блокирующих FK.
+    EXPORT manifest хранится до artifact expiry и read_protected_until, даже если job terminal.
+    Artifact -> EXPIRED запрещает новые downloads; object pin сохраняется до deadline активного чтения.
+    После read pin release EXPORT holds снимаются batches; manifest cleanup ждёт освобождения holds.
+    Unlink object + регистрация gc_task согласованы под object lock с проверкой всех references.
+    Уборка owner rows не оставляет бессрочные orphan holds и не удаляет manifest активного reader.
+    Multipart/orphan sweep ограничен space prefix, grace
+    и повторной проверкой отсутствия живого upload/object.
+    '/
+  }
+
+  ' Источник: sprut-file-manager-db-search-audit.puml
+  package "Поиск, аудит и идемпотентность" as pkg_search_audit #E7F5FF {
+    entity "search_index_task" as search_index_task #E7F5FF {
+      ' Допустимые значения колонок.
+      .. Допустимые значения ..
+      {field} task_scope = NODE | SUBTREE
+      {field} action = UPSERT | TOMBSTONE
+      {field} status = PENDING | RUNNING | RETRY | DONE | FAILED
+      == Колонки ==
+      * space_id : UUID <<PK,FK>> [Пространство цели; компонент составного PK]
+      ' Без FK: delete task переживает физический purge узла.
+      * node_id : UUID <<PK>> [Целевой узел без FK для purge; компонент составного PK]
+      ' NODE / SUBTREE; после move/rename SUBTREE раскрывается в NODE tasks.
+      * task_scope : VARCHAR(16) <<PK>> [Узел или поддерево; компонент составного PK]
+      --
+      ' UPSERT / TOMBSTONE; metadata/ACL берутся из PostgreSQL.
+      * action : VARCHAR(16) [Обновить документ либо записать tombstone]
+      ' Для NODE = fs_node.search_revision; UPSERT только увеличивает значение.
+      * desired_revision : BIGINT [Номер проекции, которую нужно довести до OpenSearch]
+      ' Revision, взятая worker, для обнаружения обновлений во время I/O.
+      processing_revision : BIGINT [Номер проекции, взятой worker; NULL до захвата]
+      ' PENDING / RUNNING / RETRY / DONE / FAILED.
+      * status : VARCHAR(16) [Состояние обработки задачи индексации]
+      * attempt : INTEGER [Счётчик попыток выполнения, включая повторы]
+      * next_attempt_at : TIMESTAMPTZ [Не раньше этого времени разрешена следующая попытка]
+      lease_owner : VARCHAR(128) [Worker, временно получивший задачу в обработку]
+      lease_until : TIMESTAMPTZ [Срок действия права worker на обработку задачи]
+      * lease_token : BIGINT [Номер захвата; запрещает commit устаревшего worker]
+      error_code : VARCHAR(64) [Машиночитаемый код последней ошибки]
+      * updated_at : TIMESTAMPTZ [Время последнего изменения записи]
+      completed_at : TIMESTAMPTZ [Время завершения обработки взятой revision]
+    }
+
+    entity "search_index_cursor" as search_index_cursor #E7F5FF {
+      ' Допустимые значения колонок.
+      .. Допустимые значения ..
+      {field} task_scope = SUBTREE
+      {field} status = PENDING | SCANNING | COMPLETE
+      == Колонки ==
+      * space_id : UUID <<PK,FK>> [Пространство родительской задачи; компонент PK и FK]
+      * root_node_id : UUID <<PK,FK>> [Корень родительской задачи SUBTREE; компонент PK и FK]
+      * task_scope : VARCHAR(16) <<PK,FK>> [Всегда SUBTREE; компонент PK и FK на задачу]
+      * folder_node_id : UUID <<PK>> [Папка текущего обхода; компонент составного PK]
+      --
+      ' task_scope всегда SUBTREE: этот cursor используется только для обхода поддерева.
+      ' Composite FK первых трёх полей на search_index_task, не на fs_node.
+      ' Поколение раскрытия SUBTREE; изменение desired_revision запускает новый проход.
+      * task_revision : BIGINT [Поколение обхода; новая revision требует нового прохода]
+      ' PENDING / SCANNING / COMPLETE.
+      * status : VARCHAR(16) [Состояние постраничного обхода папки для индексации]
+      last_child_node_id : UUID [Последний обработанный ребёнок; NULL до первой страницы]
+      * updated_at : TIMESTAMPTZ [Время последнего изменения записи]
+    }
+
+    entity "audit_event" as audit_event #FFF9DB {
+      ' Допустимые значения колонок.
+      .. Допустимые значения ..
+      {field} action = CREATE | RENAME | MOVE | TRASH | RESTORE
+      {field} action = VERSION_CREATE | GC_PURGE | ACL_CHANGE | MARKERS_CHANGE
+      {field} action = ROLE_CHANGE | RETENTION_CHANGE | UPDATE
+      {field} action = COPY | EXPORT | JOB_CANCEL | JOB_RETRY | VERSION_RETIRE
+      {field} actor_type = USER | SERVICE
+      {field} resource_type = SPACE | NODE | FILE_VERSION | ROLE
+      {field} resource_type = RETENTION_POLICY | JOB | UPLOAD | SERVICE_SETTINGS
+      {field} resource_type = EXPORT_ARTIFACT
+      == Колонки ==
+      ' Append-only внутри retention; для partitioning PK включает occurred_at.
+      * occurred_at : TIMESTAMPTZ <<PK>> [Время события и ключ партиционирования; компонент PK]
+      * id : UUID <<PK>> [ID события; вместе с occurred_at образует один PK]
+      --
+      ' Логические ID без FK на очищаемые domain rows.
+      * tenant_id : UUID [Tenant из конфигурации; событие не зависит от наличия space]
+      * resource_type : VARCHAR(32) [Тип изменяемого ресурса; значения выше]
+      * resource_id : UUID [Логический ID ресурса; без блокирующего cleanup FK]
+      space_id : UUID [NULL для административного события до создания первого space]
+      node_id : UUID [Логический ID затронутого узла; без FK]
+      version_id : UUID [Логический ID затронутой версии; без FK]
+      operation_id : UUID [Логический ID операции, породившей событие; без FK]
+      item_id : UUID [Логический ID пофайловой работы; без FK]
+      ' CREATE / RENAME / MOVE / VERSION_CREATE / TRASH / RESTORE / GC_PURGE / ACL_CHANGE.
+      * action : VARCHAR(64) [Вид зафиксированного изменения]
+      actor_id : UUID [Пользователь или сервис, выполнивший действие]
+      actor_type : VARCHAR(16) [USER или SERVICE; NULL для legacy без identity]
+      caller_id : VARCHAR(255) [Аутентифицированный вызывающий сервис; без секретов]
+      correlation_id : VARCHAR(128) [Correlation ID события и исходной команды]
+      trace_id : VARCHAR(32) [Трассировка при наличии; не заменяет correlation_id]
+      span_id : VARCHAR(16) [Операция внутри trace при наличии]
+      request_id : VARCHAR(128) [Legacy диагностическое поле; не источник identity]
+      ' Минимальное metadata; не байты файлов/копия дерева.
+      before_state : JSONB [Минимальные metadata до изменения; не байты файла]
+      after_state : JSONB [Минимальные metadata после изменения; не копия дерева]
+    }
+
+    entity "idempotency_record" as idempotency_record #F3F0FF {
+      ' Включает configured tenant + actor_type + actor_id + operation + resource.
+      * scope : VARCHAR(255) <<PK>> [Граница tenant, actor и операции; компонент составного PK]
+      * idempotency_key : VARCHAR(255) <<PK>> [Ключ повтора от клиента внутри scope; компонент PK]
+      --
+      * request_hash : CHAR(64) [SHA-256 запроса; тот же ключ с иным запросом запрещён]
+      ' Логический ID resource без FK.
+      resource_id : UUID [ID созданного ресурса или задания; логическая ссылка]
+      response_status : INTEGER [HTTP-статус сохранённого результата]
+      response_body : JSONB [Минимальное тело ответа для повторного запроса]
+      * created_at : TIMESTAMPTZ [Время создания записи]
+      * expires_at : TIMESTAMPTZ [До какого момента хранится результат для replay]
+    }
+
+    /' note bottom of search_index_task
+    INDEX(next_attempt_at) WHERE status IN ('PENDING','RETRY').
+    Claim/retry: SKIP LOCKED + leases.
+    Domain change + INSERT/UPSERT task атомарно, Kafka не нужен.
+    DONE только если desired_revision = processing_revision.
+    Новая revision во время I/O требует следующего прохода.
+    SUBTREE использует search_index_cursor, как discovery;
+    checkpoint и создание NODE tasks атомарны.
+    Для потомка bump search_revision + UPSERT NODE task в одной TX.
+    Worker удерживает читаемую версию через INDEX_READ hold до конца S3 I/O.
+    Periodic reconciliation восстанавливает индекс из PostgreSQL.
+    '/
+
+    /' note bottom of opensearch
+    Документ = space_id + node_id; текущее содержимое, без истории версий.
+    markers включены в текущую metadata projection как массив кодов.
+    API возвращает актуальные markers из fs_node, не из stale search document.
+    search_revision защищает от устаревшей записи (external version).
+    TOMBSTONE с revision предотвращает позднее воскрешение документа.
+    Physical tombstone purge только после исключения старых writers/retries;
+    rebuild с новым поколением индекса позволяет убрать их целиком.
+    Старые legacy version-documents чистятся адресными gc_task.
+    Rebuild читает PostgreSQL + current bytes, затем меняет alias.
+    Search results проходят актуальную авторизацию в File Manager.
+    Upload attempts и ZIP artifacts не индексируются как пользовательские fs_node.
+    COPY_NODE индексирует новые IDs; COPY_CONTENT обновляет revision существующего файла.
+    Catalog roles/permissions и effective permissions не читаются из OpenSearch.
+    '/
+
+    /' note bottom of audit_event
+    Partitioning по occurred_at; cleanup по audit_retention_days.
+    Для событий без space действует обязательная service-level audit retention
+    из внешней конфигурации; отсутствие spaces не означает бессрочное хранение.
+    SPACE/NODE/ROLE события имеют scope space; начальная policy может не иметь space.
+    YAML secrets/endpoints не копируются в audit; изменение инфраструктуры фиксирует deployment audit.
+    Старые партиции удаляются/архивируются после retention.
+    Job/item cleanup пакетный, с INDEX(finished_at).
+    COPY/EXPORT/cancel/retry/version retirement аудируются в TX принятия команды или публикации.
+    before/after содержит IDs и безопасные metadata, не manifest целиком и не байты архива.
+    Partitioning очередей отдельно согласует PK/FK/UNIQUE.
+    '/
+  }
+
+  ' Источник: sprut-file-manager-db-administration.puml
+  package "Роли и файловые права" as pkg_administration #FFF9DB {
+    entity "access_role" as access_role #EBFBEE {
+      .. Допустимые значения ..
+      {field} status = ACTIVE | ARCHIVED
+      == Колонки ==
+      * id : UUID <<PK>> [Постоянный UUID, назначаемый внешней identity-системой пользователю]
+      --
+      * space_id : UUID <<FK>> [Единственное пространство роли; binding в другой space запрещён]
+      * name : VARCHAR(255) [Отображаемое имя; переименование не меняет назначения]
+      description : VARCHAR(1024) [Назначение роли без секретов и персональных данных]
+      * status : VARCHAR(16) [ACTIVE либо ARCHIVED; UUID не переиспользуется]
+      * revision : BIGINT [CAS metadata и атомарной замены состава прав]
+      * created_by : UUID [Пользователь или сервис, создавший роль]
+      * created_at : TIMESTAMPTZ [Время создания роли]
+      * updated_at : TIMESTAMPTZ [Время последнего изменения роли или её прав]
+    }
+
+    entity "role_permission" as role_permission #EBFBEE {
+      .. Допустимые значения ..
+      {field} permission_code = READ | WRITE | DELETE | SHARE | ADMIN
+      == Колонки ==
+      * role_id : UUID <<PK,FK>> [Роль, содержащая разрешение; компонент PK]
+      * permission_code : VARCHAR(32) <<PK>> [Поддерживаемое кодом действие; компонент PK]
+      --
+      * created_at : TIMESTAMPTZ [Время включения права в роль]
+    }
+  }
+}
+
+entity "S3 / MinIO\nimmutable objects" as s3 #EBFBEE
+entity "OpenSearch\nтекущие документы" as opensearch #FFF9DB
+
+' bulk_change_item.source_node_id/target_parent_id и operation_id/holder_id — логические IDs.
+access_role |o--o{ node_acl : role_id / ROLE binding
+storage_space ||--o{ fs_node : space_id
+retention_policy ||--o{ storage_space : policy
+fs_node |o--o{ fs_node : parent_id
+fs_node ||--o| file_entry : FILE
+fs_node ||--|{ node_revision : history
+fs_node ||--o{ node_acl : access
+file_version |o--o{ node_revision : historical content / historical reference
+file_version |o--o| file_entry : current content
+file_entry ||--o{ file_version : history
+file_entry }o--o| file_version : current_version_id
+content_object ||--o{ file_version : immutable bytes / shared bytes
+file_version |o--o{ upload_session : base / result
+upload_session ||--o{ upload_attempt : durable attempts
+upload_attempt |o--o| upload_session : current attempt
+content_object ||--o| upload_attempt : unique attempt key / attempt reference
+bulk_change_job ||--o| export_artifact : EXPORT result
+content_object |o--o| export_artifact : current build / ready bytes / artifact reference
+content_object ..> s3 : key + provider version
+corrector_rule_set ||--o{ corrector_rule_version : immutable revisions
+corrector_rule_version |o--o{ bulk_change_job : rule_version_id
+bulk_change_job |o--o{ bulk_change_job : source_job_id / retry_of_job_id
+bulk_change_job |o--o| bulk_change_job : automatic rollback_job_id
+bulk_change_job ||--|{ bulk_change_scope : scope
+bulk_change_job ||--o{ bulk_discovery_cursor : paged discovery
+bulk_change_job ||--o{ bulk_change_item : durable manifest
+bulk_change_item |o--o{ bulk_change_item : compensation / retry lineage
+bulk_change_item ||--o{ bulk_item_dependency : item / prerequisite
+storage_space ||--o{ tree_history_hold : retained restore point
+file_version ||--o{ version_hold : protected version
+content_object |o--o{ gc_task : delete workflow
+export_artifact ..> version_hold : EXPORT source holds
+fs_node ..> search_index_task : same DB transaction
+fs_node ..> audit_event : same DB transaction
+search_index_task ||--o{ search_index_cursor : durable subtree traversal
+search_index_task ..> opensearch : PostgreSQL worker
+storage_space ||--o{ access_role : role namespace
+access_role ||--o{ role_permission : fixed permission codes
+storage_space ||--o{ content_object : space_id
+storage_space ||--o{ upload_session : space_id
+fs_node |o--o{ upload_session : target_parent_id / file_node_id
+storage_space ||--o{ export_artifact : space_id
+storage_space ||--o{ corrector_rule_set : space_id
+storage_space ||--o{ bulk_change_job : destination space
+storage_space |o--o{ bulk_change_item : COPY source_space_id
+file_version |o--o{ bulk_change_item : base / target / source / staged / result
+bulk_change_job ||--o{ tree_history_hold : job_id
+storage_space ||--o{ gc_task : space_id
+storage_space ||--o{ search_index_task : space_id
+@enduml

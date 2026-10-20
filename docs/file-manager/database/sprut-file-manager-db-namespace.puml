@@ -1,0 +1,265 @@
+' PostgreSQL — источник истины и очередь работ; S3 — неизменяемые байты.
+' Каждый .puml содержит одну самостоятельную диаграмму.
+' Обзор: sprut-file-manager-db.puml.
+' Детали: sprut-file-manager-db-{namespace,content,bulk,retention,search-audit,administration}.puml.
+' Пояснения [в скобках] видны на диаграмме; подробные comments и ограничения — в исходнике.
+' <<ref>> — таблица подробно описана в другом файле; это не новая таблица.
+' Ограничения CHECK/FK/UNIQUE и индексы указаны в комментариях.
+
+@startuml sprut-file-manager-db-namespace
+title sprut-file-manager — дерево, доступ и история
+hide methods
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam nodesep 100
+skinparam ranksep 140
+skinparam padding 2
+skinparam ArrowFontSize 12
+
+entity "storage_space" as storage_space #E7F5FF {
+  ' Допустимые значения колонок.
+  .. Допустимые значения ..
+  {field} status = ACTIVE | READ_ONLY | DISABLED
+  == Колонки ==
+  ' Логическое пространство; граница доступа, retention и S3 namespace.
+  * id : UUID <<PK>> [ID логического файлового пространства]
+  --
+  ' Владелец; проверяется во всех запросах и заданиях.
+  * tenant_id : UUID [Владелец данных; граница изоляции tenant]
+  * name : VARCHAR(255) [Отображаемое имя файлового пространства]
+  ' Фиксация общего физического размещения; не выбор подключения.
+  * storage_binding_fingerprint : CHAR(64) [SHA-256 канонического физического размещения; без credentials]
+  * search_binding_fingerprint : CHAR(64) [SHA-256 поискового размещения; не конфигурация клиента]
+  * revision : BIGINT [CAS изменяемых metadata пространства]
+  * authorization_revision : BIGINT [Поколение локальных ACL, ролей и структуры, влияющей на доступ]
+  * bucket_name : VARCHAR(255) [Имя S3 bucket; без credentials]
+  ' Физический префикс, принадлежащий только этому space.
+  * key_prefix : VARCHAR(1024) [Физический префикс объектов этого пространства]
+  ' Изменение политики не освобождает существующие holds.
+  * retention_policy_id : UUID <<FK>> [Политика хранения истории, версий и задач]
+  ' Watermark: до этого момента restore гарантировать нельзя.
+  * restore_available_from : TIMESTAMPTZ [Самый ранний гарантированно доступный момент restore]
+  ' ACTIVE / READ_ONLY / DISABLED.
+  * status : VARCHAR(32) [Режим пространства: доступно, только чтение или отключено]
+  * created_at : TIMESTAMPTZ [Время создания записи]
+  * updated_at : TIMESTAMPTZ [Время последнего изменения записи]
+}
+
+entity "fs_node" as fs_node #E7F5FF {
+  ' Допустимые значения колонок.
+  .. Допустимые значения ..
+  {field} node_type = FILE | FOLDER
+  {field} status = ACTIVE | TRASHED | PURGING
+  {field} markers [codes] = TEST_CASE | REFERENCE | NEEDS_REVIEW
+  {field} markers [default] = []
+  {field} tree_path [FOLDER] = цепочка UUID-меток от корня до узла
+  {field} tree_path [FILE] = NULL
+  == Колонки ==
+  ' Стабильный ID; rename и move не меняют его.
+  * id : UUID <<PK>> [Стабильный ID файла или папки; не меняется при move]
+  --
+  * space_id : UUID <<FK>> [Файловое пространство, которому принадлежит запись]
+  ' NULL только у единственного корня space.
+  parent_id : UUID <<FK>> [Родительская папка; NULL только для корня пространства]
+  ' Производный путь из стабильных ID; NOT NULL только для FOLDER, у FILE всегда NULL.
+  tree_path : LTREE [Технический путь папки; не имя, logical path или S3 key]
+  ' FILE / FOLDER.
+  * node_type : VARCHAR(16) [Тип узла: файл или папка]
+  * name : VARCHAR(255) [Имя узла, отображаемое пользователю]
+  ' Имя с учётом политики регистра.
+  * normalized_name : VARCHAR(255) [Имя для сравнения и уникальности с учётом регистра]
+  ' Множество стабильных кодов для UI; NOT NULL DEFAULT '{}'::text[].
+  * markers : TEXT[] [Коды UI-маркеров; без наследования, пустой массив допустим]
+  ' CAS структуры и metadata, включая markers; номер node_revision растёт при изменении состояния.
+  * revision : BIGINT [Номер состояния metadata; CAS для rename, move и markers]
+  ' Версия search projection, включая изменение пути через предка.
+  * search_revision : BIGINT [Номер поисковой проекции; учитывает смену пути]
+  ' ACTIVE / TRASHED / PURGING.
+  * status : VARCHAR(32) [Состояние узла: активен, в корзине или очищается]
+  created_by : UUID [Пользователь или сервис, создавший запись]
+  * created_at : TIMESTAMPTZ [Время создания записи]
+  * updated_at : TIMESTAMPTZ [Время последнего изменения записи]
+  ' Попадание в корзину, а не физическое удаление.
+  trashed_at : TIMESTAMPTZ [Время попадания в корзину; NULL до удаления]
+}
+
+entity "file_entry" as file_entry #EBFBEE {
+  ' Расширение fs_node только для FILE.
+  * node_id : UUID <<PK,FK>> [ID файлового узла; одновременно PK и FK на fs_node]
+  --
+  ' NULL до первого upload; FK только на версию этого файла.
+  current_version_id : UUID <<FK>> [Текущая версия этого файла; NULL до первого upload]
+  ' CAS содержимого защищает от параллельного сохранения.
+  * content_revision : BIGINT [Номер состояния содержимого; CAS при сохранении]
+  * updated_at : TIMESTAMPTZ [Время последнего изменения текущего содержимого]
+}
+
+entity "node_revision" as node_revision #FFF9DB {
+  ' Допустимые значения колонок.
+  .. Допустимые значения ..
+  {field} status = ACTIVE | TRASHED
+  {field} markers [codes] = TEST_CASE | REFERENCE | NEEDS_REVIEW
+  {field} markers [default] = []
+  == Колонки ==
+  ' История namespace и current content для restore дерева на T.
+  * id : UUID <<PK>> [ID исторического состояния узла]
+  --
+  * node_id : UUID <<FK>> [Узел, история которого сохраняется]
+  * revision : BIGINT [Номер исторического состояния внутри узла]
+  ' Исторический parent ID без FK на живой узел: не мешает purge.
+  parent_node_id : UUID [Родитель в этом состоянии; NULL у корня, без FK]
+  * name : VARCHAR(255) [Имя узла в этом историческом состоянии]
+  ' Снимок маркеров на этом интервале; NOT NULL DEFAULT '{}'::text[].
+  * markers : TEXT[] [Снимок кодов маркеров на интервале действия]
+  ' ACTIVE / TRASHED; созданный после T узел не имеет состояния на T.
+  * status : VARCHAR(32) [Историческое состояние: активен или в корзине]
+  ' Историческая content version; NULL для FOLDER.
+  file_version_id : UUID <<FK>> [Историческая версия содержимого; NULL для папки]
+  ' Интервал [valid_from, valid_to); NULL valid_to = текущий.
+  * valid_from : TIMESTAMPTZ [Начало действия состояния; включается в интервал]
+  valid_to : TIMESTAMPTZ [Конец действия состояния; не включается, NULL у текущего]
+  ' Логический ID операции без FK на удаляемый job.
+  operation_id : UUID [Операция, создавшая состояние; логическая ссылка без FK]
+  actor_id : UUID [Пользователь или сервис, выполнивший действие]
+}
+
+entity "node_acl" as node_acl #FFF9DB {
+  ' Допустимые значения колонок.
+  .. Допустимые значения ..
+  {field} subject_type = USER | GROUP | SERVICE | ROLE
+  {field} inheritance_mode = SELF | CHILDREN | SUBTREE
+  {field} permission_mask [flags] = READ=1 | WRITE=2 | DELETE=4
+  {field} permission_mask [flags] = SHARE=8 | ADMIN=16
+  {field} permission_mask [combine] = побитовое OR
+  == Колонки ==
+  * id : UUID <<PK>> [ID записи права доступа]
+  --
+  * node_id : UUID <<FK>> [Узел, на котором назначено право]
+  ' USER / GROUP / SERVICE / ROLE; прямые grants сохраняются.
+  * subject_type : VARCHAR(16) [Тип получателя права: пользователь, группа или сервис]
+  subject_id : UUID [Внешний USER/GROUP/SERVICE; NULL при subject_type=ROLE]
+  role_id : UUID <<FK>> [Локальная роль пространства; только для subject_type=ROLE]
+  ' Битовая маска: READ=1, WRITE=2, DELETE=4, SHARE=8, ADMIN=16; комбинация через OR.
+  permission_mask : INTEGER [Прямой grant: маска; ROLE: NULL, права читаются из role_permission]
+  ' SELF / CHILDREN / SUBTREE.
+  * inheritance_mode : VARCHAR(16) [Область действия: сам узел, дети или всё поддерево]
+  created_by : UUID [Пользователь или сервис, создавший запись]
+  * created_at : TIMESTAMPTZ [Время создания записи]
+  revoked_at : TIMESTAMPTZ [Время отзыва права; NULL пока оно действует]
+}
+entity "access_role" as access_role <<ref>> #FFF9DB
+entity "file_version" as file_version <<ref>> #EBFBEE
+entity "retention_policy" as retention_policy <<ref>> #F3F0FF
+
+access_role |o--o{ node_acl : role_id
+storage_space ||--o{ fs_node : space_id
+retention_policy ||--o{ storage_space : policy
+fs_node |o--o{ fs_node : parent_id
+fs_node ||--o| file_entry : FILE
+fs_node ||--|{ node_revision : history
+fs_node ||--o{ node_acl : access
+file_version |o--o{ node_revision : historical content
+file_version |o--o| file_entry : current content
+
+/' note bottom of fs_node
+  Один корень: UNIQUE(space_id) WHERE parent_id IS NULL.
+  Имя: UNIQUE(space_id, parent_id, normalized_name)
+  WHERE status = 'ACTIVE' AND parent_id IS NOT NULL.
+  INDEX(space_id, parent_id, status, normalized_name, id).
+  CREATE EXTENSION IF NOT EXISTS ltree выполняется Liquibase до создания колонки.
+  CHECK ((node_type='FOLDER' AND tree_path IS NOT NULL)
+    OR (node_type='FILE' AND tree_path IS NULL)).
+  CHECK для FOLDER: nlevel(tree_path) >= 1 и последняя метка соответствует id.
+  label(id) = 'n_' + lower(UUID без дефисов); root.tree_path = label(root.id).
+  FOLDER: tree_path = parent.tree_path || label(id); parent в том же space.
+  Последняя метка равна label(id); depth папки = nlevel(tree_path)-1.
+  Depth файла = nlevel(parent.tree_path); root имеет depth=0.
+  GiST(tree_path) WHERE node_type='FOLDER' для <@ и @>.
+  INDEX(space_id,parent_id,id) WHERE status='ACTIVE' для ID-keyset детей.
+  INDEX(space_id,parent_id,id) WHERE node_type='FOLDER' для структурного обхода.
+  Родитель — FOLDER в том же space; move запрещает циклы.
+  parent_id задаёт структуру; tree_path поддерживается синхронно, не через worker.
+  Deferred constraint trigger при INSERT/изменении parent_id или tree_path
+  проверяет текущую папку, её parent и прямых детей FOLDER; не вызывается при rename-only.
+  Обычный CHECK не читает parent: межстрочная согласованность проверяется отдельно.
+  Структурные изменения используют exclusive space lock и свежий snapshot.
+  Rename сохраняет tree_path. Move файла оставляет tree_path=NULL.
+  Move папки атомарно меняет parent_id источника и prefix всех вложенных папок,
+  включая TRASHED/PURGING; внутри TX допускаются пакеты UPDATE, между ними нет COMMIT.
+  Превышение maxAtomicMoveFolders: 413 RESOURCE_LIMIT_EXCEEDED до изменения структуры.
+  Derived rewrite потомка не меняет его revision/updated_at и не создаёт node_revision.
+  Source move создаёт history/audit и SUBTREE index intent; байты S3 не перемещаются.
+  Logical path строится по текущим именам узлов UUID-цепочки; tree_path в REST не выдаётся.
+  FILE выбирается через parent_id и tree_path родительской папки, не собственный tree_path.
+  Потомки root: FOLDER tree_path <@ root.tree_path, для FILE parent.tree_path <@ root.tree_path.
+  Равенство включает root; children исключает его явно. Ancestors берутся по меткам ID.
+  Отбор TEST_CASE: только FOLDER + markers @> ARRAY['TEST_CASE']::text[] + scope по ltree.
+  Tenant/space, status всех предков и ACL проверяются независимо от совпадения пути.
+  markers — только прямое назначение узлу, без наследования от папок.
+  Начальный набор: TEST_CASE, REFERENCE, NEEDS_REVIEW; не пользовательский справочник.
+  CHECK(markers <@ ARRAY['TEST_CASE','REFERENCE','NEEDS_REVIEW']::text[]).
+  CHECK(array_position(markers, NULL) IS NULL); пустой массив допустим.
+  Одномерный массив с lower bound = 1 либо пустой; без дублей.
+  API валидирует коды и записывает уникальные значения в стабильном порядке.
+  Реальное изменение markers: CAS revision, updated_at, новая node_revision,
+  bump search_revision + NODE search_index_task и audit_event в одной TX.
+  Не меняет file_version/content_revision и не записывает байты в S3.
+  Тот же набор кодов — no-op: без новой revision/истории/index task.
+  GIN(markers) добавлять только при измеренной необходимости фильтра по маркеру.
+'/
+/' note bottom of node_revision
+  UNIQUE(node_id, revision); один открытый интервал на node_id.
+  Интервалы одного узла не пересекаются.
+  Смена namespace/markers/current_version закрывает старую revision
+  и создаёт новую в той же транзакции.
+  На границе retention сохраняется состояние, начавшееся ДО границы.
+  Restore восстанавливает структуру/markers/содержимое; ACL не откатывается.
+  Marker-only revision повторно ссылается на ту же file_version.
+  tree_path не хранится в node_revision: это производный индекс текущего дерева.
+  Restore/rollback вычисляют пути из актуального parent в той же TX, не копируют старый prefix.
+  Перемещение исторической папки меняет пути её текущих вложенных папок атомарно;
+  при превышении maxAtomicMoveFolders item завершается FAILED/RESOURCE_LIMIT_EXCEEDED без изменений.
+  Историческое дерево на T строится по parent_node_id на T, не по текущему tree_path.
+  Узел удаляется лишь после истечения истории/holds.
+'/
+/' note bottom of node_acl
+  ROLE: role_id NOT NULL; subject_id и permission_mask NULL.
+  USER/GROUP/SERVICE: subject_id и permission_mask NOT NULL; role_id NULL.
+  Роль и узел принадлежат одному space; роль ACTIVE.
+  Роль сама по себе не даёт доступа: требуется действующий node_acl binding.
+  Права ROLE читаются из текущего role_permission, не копируются в grant.
+  SELF = узел; CHILDREN = прямые дети; SUBTREE = узел и все потомки.
+  Только ALLOW; разрешения объединяются. Потомок не отменяет grant предка.
+  Отзыв доступа сериализуется с публикацией результата worker.
+  Эффективные права вычисляются из ACL/ACTIVE ролей/доверенной identity; отдельной таблицы нет.
+  INDEX(role_id,node_id) WHERE revoked_at IS NULL AND subject_type='ROLE' для обратных bindings.
+  Архивирование роли прекращает её действие без удаления аудита и UUID.
+'/
+/' note bottom of storage_space
+  tenant_id берётся из sprut.file-manager.tenant-id, не из запроса.
+  Единственный S3 endpoint берётся из YAML; bucket_name/key_prefix
+  фиксируют размещение. Переезд существующих объектов не является PATCH metadata.
+  Все spaces используют общие MinIO/OpenSearch; выбора подключения нет.
+  В space хранятся immutable binding metadata/fingerprints, не endpoints и не secrets.
+  Общий YAML задаёт bucket/base-prefix; space получает prefix base/spaces/spaceId/.
+  При старте сверяются общие targets/fingerprints всех spaces; mismatch блокирует admission.
+  Fingerprints исключают credentials и client timeouts; новое размещение требует migration/cutover.
+  Уникальные space UUID/prefix не допускают overlap пространств.
+  Policy принадлежит configured tenant; raw bucket/endpoint/prefix в createSpace запрещены.
+  Первое пространство создаётся через MVC или REST. Ноль spaces допустим при старте.
+  authorization_revision монотонно меняется при ACL/role и любой структурной mutation:
+  create/rename/move/trash/restore, NEW upload и purge metadata; контентный UPDATE его не меняет.
+  authorization_revision NOT NULL DEFAULT 1, CHECK authorization_revision >= 1.
+  Это не metadata revision и не доказательство полномочий без проверки ACL/identity.
+  Локальная авторизация mutations: короткая TX берёт shared lock строки space,
+  затем читает актуальные ACL/role_permission и публикует изменения.
+  Любая ACL/role mutation берёт exclusive lock той же строки до проверки/изменения grants.
+  Структурные mutations берут exclusive lock с начала TX и повышают authorization_revision.
+  Preflight move: лимит папок, depth и длина logical path вне TX; generation сверяется под lock.
+  При смене поколения — bounded retry/409; внутри TX разрешён только ограниченный atomic rewrite.
+  Нельзя публиковать новый parent раньше обновления всех tree_path или продолжать rewrite после COMMIT.
+  Для cross-space COPY строки source/destination space блокируются в порядке UUID.
+  После lock используется свежий READ COMMITTED snapshot; stale snapshot не подтверждает доступ.
+  Этот барьер защищает локальные ACL/роли, но не заменяет внешний membership refresh/expiry.
+'/
+@enduml

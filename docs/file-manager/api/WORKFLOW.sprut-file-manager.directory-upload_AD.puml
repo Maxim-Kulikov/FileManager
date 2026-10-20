@@ -1,0 +1,157 @@
+' workflow: directory-upload; не самостоятельный HTTP endpoint.
+' Операции: createNode, createUploadSession, uploadContent, completeUploadSession,
+' getUploadSession, abortUploadSession, resolveNodeByPath, getNode.
+@startuml directory_upload_AD
+title Загрузка дерева папок\nКлиентский сценарий поверх файловых API
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam activityBackgroundColor #E7F5FF
+|КЛИЕНТ|
+start
+:Входные данные клиентского сценария;
+note right
+  spaceId*, destination folderId*
+  collisionPolicy?: FAIL | MERGE_FOLDERS | OVERWRITE_FILES
+  local entries*[]: relativePath*, type*, bytes для FILE
+  Обозначения: * обязательное, ? необязательное
+  Это не самостоятельный HTTP Request
+end note
+:Получить destination spaceId/folderId и collision policy = FAIL.
+Создать journal и mapping: пустой relative path → folderId.
+Ограничить число одновременно активных file streams;
+:Перечислять локальные entries ограниченными batches.
+Родительские папки обрабатывать до детей;
+while (Есть следующая entry?) is (да)
+  if (Пользователь запросил отмену?) then (да)
+    break
+  endif
+  :Взять entry с relativePath, type и доступом к local bytes.
+  Найти parentId в mapping по relative parent path;
+  if (Parent отсутствует в mapping или subtree уже blocked?) then (да)
+    :Записать SKIPPED для entry;
+  else (родитель найден)
+    :Проверить сегменты имени, глубину и размер entry;
+    if (Entry нарушает ограничения?) then (да)
+      :Записать FAILED с причиной.
+      Для FOLDER пометить subtree blocked;
+    else (параметры допустимы)
+      if (entry.type = FOLDER?) then (да)
+        :POST nodes: parentId, type = FOLDER, name.
+        Idempotency-Key сохранить в journal до запроса;
+        if (Ответ 201?) then (да)
+          :Сохранить relativePath → response.id в mapping;
+        else (не 201)
+          if (Ответ потерян или 503?) then (да)
+            :Записать PENDING и исходный key в journal.
+            Продолжение повторяет ту же команду с тем же key.
+            Subtree не продолжать без полученного nodeId;
+          else (известная ошибка)
+            if (409 NAME_COLLISION и policy разрешает merge папок?) then (да)
+              :GET resolve для relativePath внутри destination;
+              if (Ответ 200 и type = FOLDER?) then (да)
+                :Сохранить relativePath → найденный id в mapping;
+              else (не папка)
+                :Записать CONFLICT, пометить subtree blocked;
+              endif
+            else (merge запрещён)
+              :Записать ошибку ответа, пометить subtree blocked;
+            endif
+          endif
+        endif
+      else (FILE)
+        :По умолчанию mode = NEW.
+        При явно выбранном overwrite: resolve relativePath;
+        if (Overwrite выбрал существующий FILE?) then (да)
+          :GET Node по найденному id.
+          mode = UPDATE, fileNodeId = id,
+          baseVersionId = currentVersionId,
+          expectedContentRevision = contentRevision;
+        endif
+        :POST uploads с выбранным mode.
+        Сохранить key команды и полученный uploadId в journal;
+        if (Session не создана и исход команды неизвестен?) then (да)
+          :Записать PENDING и key исходного POST.
+          Продолжение повторяет только тот же POST с тем же key;
+        else (ответ известен)
+          if (Ответ POST не 201?) then (да)
+            :Записать FAILED с кодом ответа;
+          else (session создана)
+            :u = Upload из ответа;
+            while (Результат файла не определён и budget не исчерпан?) is (да)
+              if (Пользователь запросил отмену?) then (да)
+                break
+              endif
+              if (u.status = COMPLETED?) then (да)
+                :Записать PUBLISHED с u.resultVersionId;
+              else (не опубликован)
+                if (u.status IN ABORTED, EXPIRED, FAILED?) then (да)
+                  :Записать FAILED с u.status и errorCode;
+                else (session активна)
+                  if (u.transferStatus IN NONE, FAILED, ABORTED, EXPIRED?) then (да)
+                    :PUT content из local file в ту же session;
+                    if (Ответ PUT содержит окончательную ошибку клиента?) then (да)
+                      :Для 400/403/404/410/413/415/422 записать FAILED.
+                      Для 409 UPLOAD_ABORTED записать FAILED.
+                      Для 409 UPLOAD_WRITER_CONFLICT сверить session через GET;
+                    endif
+                  else (bytes уже передаются или получены)
+                    if (u.transferStatus IN UPLOADED, VERIFIED?) then (да)
+                      :POST complete для того же uploadId;
+                      if (Ответ 409 CONTENT_REVISION_MISMATCH или NAME_COLLISION?) then (да)
+                        :Записать CONFLICT. Не перезаписывать иной файл;
+                      endif
+                      if (Ответ complete = 400/403/404/410/422?) then (да)
+                        :Записать FAILED с кодом ответа;
+                      endif
+                    else (RESERVED, UPLOADING, VERIFYING)
+                      :Ждать по bounded backoff без второго writer;
+                    endif
+                  endif
+                  if (Результат ещё не определён?) then (да)
+                    :GET uploads по сохранённому uploadId;
+                    if (Ответ GET = 200?) then (да)
+                      :u = Upload из ответа;
+                    else (ошибка)
+                      if (Ответ 503 или потерян?) then (да)
+                        :Ждать bounded backoff до следующей сверки;
+                      else (окончательная ошибка)
+                        :Записать FAILED с кодом ответа;
+                      endif
+                    endif
+                  endif
+                endif
+              endif
+            endwhile (нет)
+            :Если исход не определён, сохранить PENDING и uploadId.
+            Потеря ответа не означает FAILED или отсутствие публикации;
+          endif
+        endif
+      endif
+    endif
+  endif
+endwhile (нет)
+if (Пользователь запросил отмену?) then (да)
+  :Остановить discovery и запуск новых запросов.
+  DELETE каждого известного неопубликованного uploadId;
+  :204 — session отменена.
+  409 UPLOAD_ALREADY_COMPLETED — GET session и сохранить PUBLISHED.
+  При неизвестном исходе сохранить uploadId для сверки;
+endif
+:Показать PUBLISHED/FAILED/CONFLICT/SKIPPED/PENDING.
+Сохранить journal и mapping для продолжения;
+note right
+  Успешные siblings сохраняются.
+  Empty directories требуют directory entries от клиента.
+  Нет server directory jobId и атомарного отката дерева.
+  Progress считает client entries и GET Upload snapshots.
+end note
+note right
+  Результат клиентского сценария
+  entries[]: relativePath, state, uploadId?, nodeId?, versionId?, errorCode?
+  state: PUBLISHED | FAILED | CONFLICT | SKIPPED | PENDING
+  journal: Idempotency-Key и uploadId для повторных запросов
+  mapping: relative folder path → nodeId
+  Это не самостоятельный HTTP Response
+end note
+stop
+@enduml

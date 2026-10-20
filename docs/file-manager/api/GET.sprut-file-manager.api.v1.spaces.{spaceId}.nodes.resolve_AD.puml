@@ -1,0 +1,101 @@
+' operationId: resolveNodeByPath
+' method: GET
+' path: /api/v1/spaces/{spaceId}/nodes/resolve
+' Общие правила REQ, ACL, ERR: README.md.
+@startuml resolveNodeByPath_AD
+title Поиск узла по логическому пути\nGET /sprut-file-manager/api/v1/spaces/{spaceId}/nodes/resolve
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam partitionBorderColor #7950F2
+skinparam partitionBackgroundColor #F3F0FF
+skinparam activityBackgroundColor #E7F5FF
+|SPRUT-FILE-MANAGER|
+start
+:Request;
+note right
+  Request: GET /sprut-file-manager/api/v1/spaces/{spaceId}/nodes/resolve
+  Path:
+    spaceId*
+  Query:
+    path*, includeTrashed?
+  Headers:
+    X-Actor-Id*, X-Actor-Type*, X-Actor-Roles?, X-Actor-Groups?
+    X-Correlation-Id?, traceparent?, tracestate?
+  Body: отсутствует
+  Обозначения: * обязательное, ? необязательное, (null) допускает null
+end note
+:Получить spaceId, path и includeTrashed = false по умолчанию;
+:Разобрать path после однократного HTTP decoding.
+Проверить ведущий /, длину <= 4096, отсутствие пустых
+внутренних сегментов, dot/dotdot, backslash и control chars;
+if (Путь нарушает формат LogicalPath?) then (да)
+  :Ответ 400 VALIDATION_ERROR, violations.path;
+  stop
+endif
+:Нормализовать имена сегментов NFC и по политике регистра;
+partition "TX — PostgreSQL, REPEATABLE READ (read-only)" {
+:Начать read-only TX REPEATABLE READ;
+:Найти storage_space s по id = spaceId
+и tenant_id = configuredTenantId;
+if (Пространство не найдено?) then (да)
+  :Завершить TX. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (s.status = DISABLED?) then (да)
+  :Завершить TX. Ответ 403 SPACE_DISABLED;
+  stop
+endif
+:Найти корень fs_node по space_id = spaceId, parent_id IS NULL.
+Получить цепочку по parent_id + normalized_name
+для последовательности сегментов.
+Приоритет ACTIVE. Если ACTIVE отсутствует и includeTrashed = true,
+рассмотреть TRASHED с тем же parent/name;
+if (Сегмент соответствует нескольким TRASHED узлам?) then (да)
+  :Завершить TX. Ответ 409 PATH_INVALID;
+  stop
+endif
+if (Путь не найден полностью?) then (да)
+  :Завершить TX. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (Есть PURGING узел в цепочке?) then (да)
+  :Завершить TX. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (includeTrashed = false и есть TRASHED узел?) then (да)
+  :Завершить TX. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+:Вычислить grants по ACL для найденной цепочки;
+if (Нет READ для результата или видимости предков?) then (да)
+  :Завершить TX. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (path оканчивается /, но результат FILE?) then (да)
+  :Завершить TX. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+:Прочитать file metadata, если результат FILE.
+Завершить TX;
+}
+:Ответ 200 Node с найденным id, parentId, path, revision и markers;
+note right
+Response
+200:
+  Headers:
+    ETag, X-Correlation-Id
+  Content-Type: application/json
+  Body: Node
+    id*, spaceId*, parentId* (null), type*, name*, path*, markers*, revision*
+    status*, createdAt*, updatedAt*, trashedAt? (null), file?
+    file (только FILE):
+      currentVersionId* (null), contentRevision*, sizeBytes* (null)
+      contentType* (null), checksumSha256* (null)
+Ошибки: application/problem+json
+  type*, title*, status*, code*, detail?, instance?, requestId*, violations?[]
+  correlationId*, traceId? (null)
+  violations?[]: field*, code*, message*
+Обозначения: * обязательное, ? необязательное, (null) допускает null
+end note
+stop
+@enduml

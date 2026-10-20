@@ -1,0 +1,306 @@
+' operationId: completeUploadSession
+' method: POST
+' path: /api/v1/uploads/{uploadId}/complete
+' Общие правила REQ, ACL, UPLOAD_ACCESS, HIST, INDEX, ERR: README.md.
+@startuml completeUploadSession_AD
+title Проверка и публикация файла\nPOST /sprut-file-manager/api/v1/uploads/{uploadId}/complete
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam partitionBorderColor #7950F2
+skinparam partitionBackgroundColor #F3F0FF
+skinparam activityBackgroundColor #E7F5FF
+|SPRUT-FILE-MANAGER|
+start
+:Request;
+note right
+  Request: POST /sprut-file-manager/api/v1/uploads/{uploadId}/complete
+  Path:
+    uploadId*
+  Headers:
+    X-Actor-Id*, X-Actor-Type*, X-Actor-Roles?, X-Actor-Groups?
+    X-Correlation-Id?, traceparent?, tracestate?
+  Content-Type*: application/json
+  Body:
+    checksumSha256?
+    Допустим пустой JSON object
+  Обозначения: * обязательное, ? необязательное, (null) допускает null
+end note
+:Получить uploadId и необязательный checksumSha256;
+:Найти upload_session по id = uploadId
+с JOIN storage_space по configuredTenantId;
+if (Сессия не найдена?) then (да)
+  :Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+partition "TX 1 — захват проверки, READ COMMITTED" {
+:BEGIN. storage_space FOR SHARE, затем session u FOR UPDATE;
+if (Сессия удалена после первоначального поиска?) then (да)
+  :ROLLBACK. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+:Получить target, предков и grants по UPLOAD_ACCESS;
+if (Target отсутствует или скрыт по UPLOAD_ACCESS?) then (да)
+  :ROLLBACK. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (u.created_by != actorId и нет ADMIN для target?) then (да)
+  :ROLLBACK. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (s.status = DISABLED?) then (да)
+  :ROLLBACK. Ответ 403 SPACE_DISABLED;
+  stop
+endif
+if (Нет WRITE для target?) then (да)
+  :ROLLBACK. Ответ 403 ACCESS_DENIED;
+  stop
+endif
+if (u.status = COMPLETED?) then (да)
+  :Прочитать result file_version v по u.result_version_id
+  и checksum её content_object;
+  if (v отсутствует или v.status = RETIRED?) then (да)
+    :ROLLBACK. Ответ 410 VERSION_EXPIRED;
+    stop
+  endif
+  if (checksumSha256 задан и отличается от checksum результата?) then (да)
+    :ROLLBACK. Ответ 422 CHECKSUM_MISMATCH;
+    stop
+  endif
+  :COMMIT без изменения pointer.
+  Ответ 200 UploadCompleteResult с этой версией;
+  stop
+endif
+if (u.status = ABORTED?) then (да)
+  :ROLLBACK. Ответ 409 UPLOAD_ABORTED;
+  stop
+endif
+if (u.status = FAILED?) then (да)
+  :ROLLBACK. Ответ 409 UPLOAD_WRITER_CONFLICT;
+  stop
+endif
+if (u.status = EXPIRED или u.expires_at <= now?) then (да)
+  :ROLLBACK. Ответ 410 UPLOAD_EXPIRED;
+  stop
+endif
+if (s.status = READ_ONLY?) then (да)
+  :ROLLBACK. Ответ 403 SPACE_READ_ONLY;
+  stop
+endif
+:Найти upload_attempt a по u.current_attempt_id FOR UPDATE;
+if (a отсутствует или a.status IN RESERVED, UPLOADING, FAILED, ABORTED, EXPIRED?) then (да)
+  :ROLLBACK. Ответ 409 CONTENT_NOT_READY;
+  stop
+endif
+if (a.status = VERIFYING и a.lease_until > now?) then (да)
+  :COMMIT без нового claim. Ответ 202 Upload;
+  stop
+endif
+if (a.status != VERIFIED?) then (да)
+  :a.status = VERIFYING, lease_token += 1,
+  lease_owner = verifierId, lease_until = now + verifierLease.
+  u.status = VERIFYING, revision += 1.
+  Сохранить attemptId/token, needsVerification = true;
+else (уже VERIFIED)
+  :Сохранить attemptId = a.id, token = a.lease_token,
+  needsVerification = false;
+endif
+:COMMIT;
+}
+if (needsVerification = true?) then (да)
+  :Вне TX прочитать точный content_object key/provider version.
+  Проверить размер и вычислить SHA-256 с продлением lease;
+  if (MinIO недоступен или истёк timeout проверки?) then (да)
+    :Записать DEPENDENCY_UNAVAILABLE при сохранённом token.
+    Ответ 503 DEPENDENCY_UNAVAILABLE;
+    stop
+  endif
+  if (verifiedSize != a.uploaded_bytes?) then (да)
+    :FAIL_TRANSFER для attemptId/token: SIZE_MISMATCH.
+    Ответ 422 UPLOAD_SIZE_MISMATCH;
+    stop
+  endif
+  if (verifiedHash != SHA-256, сохранённому при PUT?) then (да)
+    :FAIL_TRANSFER для attemptId/token: CHECKSUM_MISMATCH.
+    Ответ 422 CHECKSUM_MISMATCH;
+    stop
+  endif
+  if (Размер отличается от expected_size_bytes при его наличии?) then (да)
+    :FAIL_TRANSFER для attemptId/token: SIZE_MISMATCH.
+    Ответ 422 UPLOAD_SIZE_MISMATCH;
+    stop
+  endif
+  if (SHA-256 отличается от expected_checksum_sha256 при его наличии?) then (да)
+    :FAIL_TRANSFER для attemptId/token: CHECKSUM_MISMATCH.
+    Ответ 422 CHECKSUM_MISMATCH;
+    stop
+  endif
+partition "TX 2 — сохранение проверенного объекта, READ COMMITTED" {
+  :BEGIN. В порядке space → session → attempt → object
+  заблокировать записи и повторно прочитать их состояние;
+  if (u.current_attempt_id != attemptId или a.lease_token != token?) then (да)
+    :ROLLBACK. Ответ 409 UPLOAD_WRITER_CONFLICT;
+    stop
+  endif
+  if (u.status = ABORTED?) then (да)
+    :ROLLBACK. Ответ 409 UPLOAD_ABORTED;
+    stop
+  endif
+  if (u.status = EXPIRED или u.expires_at <= now?) then (да)
+    :ROLLBACK. Ответ 410 UPLOAD_EXPIRED;
+    stop
+  endif
+  if (a.status != VERIFYING или a.lease_until <= now?) then (да)
+    :ROLLBACK. Ответ 409 UPLOAD_WRITER_CONFLICT;
+    stop
+  endif
+  if (content_object.status != RESERVED?) then (да)
+    :ROLLBACK. Ответ 409 CONTENT_NOT_READY;
+    stop
+  endif
+  :UPDATE content_object: status = AVAILABLE, verified_at = txTime,
+  checksum_sha256 = verifiedHash, size_bytes = verifiedSize.
+  UPDATE a: status = VERIFIED, lease_owner/lease_until = NULL.
+  COMMIT;
+}
+endif
+partition "TX 3 — публикация файла, READ COMMITTED" {
+:BEGIN READ COMMITTED.
+NEW: storage_space FOR UPDATE. UPDATE: storage_space FOR SHARE.
+Затем session u FOR UPDATE, current attempt a FOR UPDATE;
+:Повторно получить target/предков и текущие grants по UPLOAD_ACCESS;
+if (Target отсутствует или скрыт по UPLOAD_ACCESS?) then (да)
+  :ROLLBACK. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (Нет WRITE или больше нет права управлять session?) then (да)
+  :ROLLBACK. Ответ 403 ACCESS_DENIED;
+  stop
+endif
+if (s.status = DISABLED?) then (да)
+  :ROLLBACK. Ответ 403 SPACE_DISABLED;
+  stop
+endif
+if (u.status = COMPLETED?) then (да)
+  :Прочитать result file_version v и checksum её content_object;
+  if (v отсутствует или v.status = RETIRED?) then (да)
+    :ROLLBACK. Ответ 410 VERSION_EXPIRED;
+    stop
+  endif
+  if (checksumSha256 задан и отличается от checksum результата?) then (да)
+    :ROLLBACK. Ответ 422 CHECKSUM_MISMATCH;
+    stop
+  endif
+  :COMMIT без новой версии. Ответ 200 UploadCompleteResult;
+  stop
+endif
+if (s.status = READ_ONLY?) then (да)
+  :ROLLBACK. Ответ 403 SPACE_READ_ONLY;
+  stop
+endif
+if (u.status = ABORTED?) then (да)
+  :ROLLBACK. Ответ 409 UPLOAD_ABORTED;
+  stop
+endif
+if (u.status = EXPIRED или u.expires_at <= now?) then (да)
+  :ROLLBACK. Ответ 410 UPLOAD_EXPIRED;
+  stop
+endif
+if (u.status = FAILED?) then (да)
+  :ROLLBACK. Ответ 409 UPLOAD_WRITER_CONFLICT;
+  stop
+endif
+if (u.current_attempt_id != attemptId или a.lease_token != token?) then (да)
+  :ROLLBACK. Ответ 409 UPLOAD_WRITER_CONFLICT;
+  stop
+endif
+:Найти content_object o по a.content_object_id FOR UPDATE;
+if (a.status != VERIFIED или o.status != AVAILABLE?) then (да)
+  :ROLLBACK. Ответ 409 CONTENT_NOT_READY;
+  stop
+endif
+if (checksumSha256 задан и != o.checksum_sha256?) then (да)
+  :ROLLBACK. Ответ 422 CHECKSUM_MISMATCH;
+  stop
+endif
+if (u.file_node_id IS NULL?) then (NEW)
+  :Проверить тип target_parent_id;
+  if (Родитель не FOLDER?) then (да)
+    :ROLLBACK. Ответ 422 NODE_TYPE_MISMATCH;
+    stop
+  endif
+  :Проверить tree_path родителя по TREE.
+  depth FILE = nlevel(parent.tree_path), вычислить длину logical path;
+  if (Превышен maxDepth или maxPathLength?) then (да)
+    :ROLLBACK. Ответ 422 VALIDATION_ERROR;
+    stop
+  endif
+  :INSERT FILE fs_node по target_parent_id/requested_name,
+  tree_path = NULL, revision = search_revision = 1.
+  INSERT file_entry с content_revision = 0;
+  if (Нарушен UNIQUE активного sibling name?) then (да)
+    :ROLLBACK. Ответ 409 NAME_COLLISION;
+    stop
+  endif
+  :UPDATE space: authorization_revision += 1;
+else (UPDATE)
+  :Найти file_entry по node_id = u.file_node_id FOR UPDATE;
+  if (current_version_id IS DISTINCT FROM u.base_version_id\nили content_revision != u.expected_content_revision?) then (да)
+    :ROLLBACK. Ответ 409 CONTENT_REVISION_MISMATCH;
+    stop
+  endif
+  :UPDATE fs_node: revision += 1, search_revision += 1,
+  updated_at = txTime;
+endif
+:INSERT file_version: новый versionId, file_node_id,
+следующий version_number, content_object_id = o.id,
+origin = UPLOAD, status = AVAILABLE, MIME/charset из u,
+created_at = activated_at = txTime;
+:UPDATE file_entry: current_version_id = versionId,
+content_revision += 1, updated_at = txTime.
+Закрыть прошлую node_revision и вставить новую по HIST;
+:INSERT audit_event action = CONTENT_PUBLISH.
+UPSERT search_index_task NODE по INDEX.
+UPDATE u: status = COMPLETED, result_version_id = versionId,
+completed_at = txTime, revision += 1;
+:COMMIT;
+}
+:Ответ 200 UploadCompleteResult: uploadId, node, version;
+note right
+Response
+200:
+  Headers:
+    X-Correlation-Id
+  Content-Type: application/json
+  Body: UploadCompleteResult
+    uploadId*, node*, version*
+    node:
+      id*, spaceId*, parentId* (null), type*, name*, path*, markers*, revision*
+      status*, createdAt*, updatedAt*, trashedAt? (null), file?
+      file (только FILE):
+        currentVersionId* (null), contentRevision*, sizeBytes* (null)
+        contentType* (null), checksumSha256* (null)
+    version:
+      id*, fileNodeId*, versionNumber*, sizeBytes*, checksumSha256*, contentType*
+      charset? (null), origin*, status*, sourceVersionId? (null)
+      operationId? (null), createdAt*, createdBy? (null), current*
+202:
+  Headers:
+    Location, X-Correlation-Id
+  Content-Type: application/json
+  Body: Upload
+    id*, spaceId*, status*, parentId? (null), fileNodeId? (null)
+    expectedSizeBytes* (null), uploadedBytes*, resultVersionId? (null), expiresAt*
+    createdAt*, errorCode? (null), transferStatus*, attemptNumber*
+Ошибки: application/problem+json
+  type*, title*, status*, code*, detail?, instance?, requestId*, violations?[]
+  correlationId*, traceId? (null)
+  violations?[]: field*, code*, message*
+Обозначения: * обязательное, ? необязательное, (null) допускает null
+
+  REPLAY_UPLOAD разобран в README.
+  Повтор не переключает current pointer на старый результат.
+  Все данные публикации фиксируются одной TX.
+  MinIO I/O внутри TX отсутствует.
+end note
+stop
+@enduml

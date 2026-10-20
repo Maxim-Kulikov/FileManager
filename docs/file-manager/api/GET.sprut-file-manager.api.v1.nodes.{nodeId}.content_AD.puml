@@ -1,0 +1,156 @@
+' operationId: downloadContent
+' method: GET
+' path: /api/v1/nodes/{nodeId}/content
+' Общие правила REQ, ACL, ERR: README.md.
+@startuml downloadContent_AD
+title Чтение содержимого файла\nGET /sprut-file-manager/api/v1/nodes/{nodeId}/content
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam partitionBorderColor #7950F2
+skinparam partitionBackgroundColor #F3F0FF
+skinparam activityBackgroundColor #E7F5FF
+|SPRUT-FILE-MANAGER|
+start
+:Request;
+note right
+  Request: GET /sprut-file-manager/api/v1/nodes/{nodeId}/content
+  Path:
+    nodeId*
+  Query:
+    versionId?, disposition?
+  Headers:
+    Range?, If-None-Match?, X-Actor-Id*, X-Actor-Type*, X-Actor-Roles?
+    X-Actor-Groups?, X-Correlation-Id?, traceparent?, tracestate?, If-Range?
+  Body: отсутствует
+  Обозначения: * обязательное, ? необязательное, (null) допускает null
+end note
+:Получить nodeId, versionId, disposition,
+If-None-Match, Range и If-Range;
+partition "TX — выбор версии и read hold, READ COMMITTED" {
+:BEGIN. Найти fs_node n по id = nodeId,
+storage_space s по id = n.space_id
+и tenant_id = configuredTenantId FOR SHARE;
+if (Узел не найден?) then (да)
+  :ROLLBACK. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+:Получить предков и grants по ACL;
+if (n или предок не ACTIVE?) then (да)
+  :ROLLBACK. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (Нет READ для n или видимости предков?) then (да)
+  :ROLLBACK. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (s.status = DISABLED?) then (да)
+  :ROLLBACK. Ответ 403 SPACE_DISABLED;
+  stop
+endif
+if (n.node_type != FILE?) then (да)
+  :ROLLBACK. Ответ 409 NODE_TYPE_MISMATCH;
+  stop
+endif
+:Найти file_entry по node_id = nodeId.
+selectedVersionId = query.versionId,
+если не передан — file_entry.current_version_id;
+if (selectedVersionId IS NULL?) then (да)
+  :ROLLBACK. Ответ 409 CONTENT_NOT_READY;
+  stop
+endif
+:Найти file_version v по id = selectedVersionId
+и file_node_id = nodeId FOR UPDATE;
+if (Версия не найдена?) then (да)
+  :ROLLBACK. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (v.status = RETIRED?) then (да)
+  :ROLLBACK. Ответ 410 VERSION_EXPIRED;
+  stop
+endif
+if (v.status != AVAILABLE?) then (да)
+  :ROLLBACK. Ответ 409 CONTENT_NOT_READY;
+  stop
+endif
+:Найти content_object o по id = v.content_object_id FOR UPDATE;
+if (o.status != AVAILABLE?) then (да)
+  :ROLLBACK. Ответ 503 DEPENDENCY_UNAVAILABLE;
+  stop
+endif
+:Сформировать strong ETag по v.id и o.checksum_sha256;
+if (If-None-Match соответствует ETag?) then (да)
+  :COMMIT без hold. Ответ 304 без body;
+  stop
+endif
+if (If-Range передан и не соответствует выбранной версии?) then (да)
+  :Игнорировать Range;
+endif
+if (Range задан и не проигнорирован?) then (да)
+  :Разобрать один bytes=start-end, start- или -suffix.
+  Рассчитать start/end по o.size_bytes;
+  if (Формат неверен, несколько ranges или диапазон вне файла?) then (да)
+    :ROLLBACK. Ответ 416 RANGE_NOT_SATISFIABLE,
+    Content-Range: bytes */size;
+    stop
+  endif
+  :responseStatus = 206, contentLength = end - start + 1;
+else (полный файл)
+  :responseStatus = 200, contentLength = o.size_bytes;
+endif
+:INSERT version_hold: version_id = v.id,
+holder_type = CONTENT_READ, holder_id = новый readId,
+expires_at = now + readLease, released_at = NULL.
+Зафиксировать exact key/provider version. COMMIT;
+}
+:Вне TX открыть MinIO stream выбранного object/range.
+До отправки HTTP headers проверить открытие потока;
+if (MinIO вернул ошибку или timeout?) then (да)
+  :Закрыть stream, освободить hold.
+  Ответ 503 DEPENDENCY_UNAVAILABLE;
+  stop
+endif
+:Отправить responseStatus, ETag, Content-Length,
+Content-Type/charset версии, Content-Disposition по disposition,
+Accept-Ranges и nosniff. Для 206 добавить Content-Range;
+:Передавать bytes ограниченными buffers до EOF.
+Продлевать read hold до expires_at короткими TX;
+if (Disconnect, ошибка чтения или hold не продлён вовремя?) then (да)
+  :Прекратить поток. Закрыть stream и освободить hold.
+  Записать ошибку с readId/correlationId.
+  Новый HTTP status и JSON не отправлять;
+  stop
+endif
+:В finally закрыть stream,
+UPDATE version_hold SET released_at = now по id hold;
+:Завершить HTTP body;
+note right
+Response
+200:
+  Headers:
+    ETag, X-Content-Revision-ETag, Accept-Ranges, Content-Length
+    Content-Disposition, X-Correlation-Id
+  Content-Type: application/octet-stream
+  Body: bytes выбранной версии
+206:
+  Headers:
+    ETag, X-Content-Revision-ETag, Accept-Ranges, Content-Length
+    Content-Disposition, Content-Range, X-Correlation-Id
+  Content-Type: application/octet-stream
+  Body: bytes выбранной версии в указанном диапазоне
+304:
+  Headers:
+    X-Correlation-Id
+  Body: отсутствует
+  Content-Type/charset: MIME и charset file_version
+Ошибки: application/problem+json
+  type*, title*, status*, code*, detail?, instance?, requestId*, violations?[]
+  correlationId*, traceId? (null)
+  violations?[]: field*, code*, message*
+Обозначения: * обязательное, ? необязательное, (null) допускает null
+
+  Без Range файл 0 bytes: 200, Content-Length = 0.
+  Server не перекодирует bytes.
+  Поздний edit не меняет выбранную immutable version.
+end note
+stop
+@enduml

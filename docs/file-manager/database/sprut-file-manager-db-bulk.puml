@@ -1,0 +1,327 @@
+' PostgreSQL — источник истины и очередь работ; S3 — неизменяемые байты.
+' Каждый .puml содержит одну самостоятельную диаграмму.
+' Обзор: sprut-file-manager-db.puml.
+' Детали: sprut-file-manager-db-{namespace,content,bulk,retention,search-audit,administration}.puml.
+' Пояснения [в скобках] видны на диаграмме; подробные comments и ограничения — в исходнике.
+' <<ref>> — таблица подробно описана в другом файле; это не новая таблица.
+' Ограничения CHECK/FK/UNIQUE и индексы указаны в комментариях.
+
+@startuml sprut-file-manager-db-bulk
+title sprut-file-manager — PostgreSQL очередь массовых операций
+left to right direction
+hide methods
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam packageStyle rectangle
+skinparam nodesep 100
+skinparam ranksep 140
+skinparam padding 2
+skinparam ArrowFontSize 12
+
+package "Правила" #FFF9DB {
+  entity "corrector_rule_set" as corrector_rule_set {
+    ' Допустимые значения колонок.
+    .. Допустимые значения ..
+    {field} status = ACTIVE | ARCHIVED
+    == Колонки ==
+    * id : UUID <<PK>> [ID набора правил с независимыми версиями]
+    --
+    * space_id : UUID <<FK>> [Файловое пространство, которому принадлежит запись]
+    * name : VARCHAR(255) [Отображаемое имя набора правил]
+    ' ACTIVE / ARCHIVED; архивирование не меняет выполняющийся job.
+    * status : VARCHAR(16) [Набор доступен для запуска или архивирован]
+    * revision : BIGINT [CAS имени и архивирования набора; не номер immutable версии правил]
+    * created_by : UUID [Пользователь или сервис, создавший запись]
+    * created_at : TIMESTAMPTZ [Время создания записи]
+    * updated_at : TIMESTAMPTZ [Время последнего изменения записи]
+  }
+  entity "corrector_rule_version" as corrector_rule_version {
+    ' Допустимые значения колонок.
+    .. Допустимые значения ..
+    {field} corrector_type [built-in] = TXT_REGULAR | TEST_JSON | PARAMETRIZATION
+    {field} corrector_type [extension] = ID зарегистрированного plugin
+    == Колонки ==
+    * id : UUID <<PK>> [ID неизменяемой версии правил]
+    --
+    * rule_set_id : UUID <<FK>> [Набор правил, которому принадлежит версия]
+    * version_number : BIGINT [Номер версии внутри набора правил]
+    ' TXT_REGULAR / TEST_JSON / PARAMETRIZATION / зарегистрированный plugin.
+    * corrector_type : VARCHAR(64) [Встроенный корректор или ID разрешённого plugin]
+    ' Immutable описание фильтров, выражений и замен.
+    * definition : JSONB [Неизменяемые фильтры, выражения и параметры замен]
+    * definition_hash : CHAR(64) [SHA-256 канонического описания правил]
+    ' Валидированный движок/DSL, не произвольный исполняемый код.
+    * engine_version : VARCHAR(64) [Версия движка или DSL для воспроизводимого выполнения]
+    * created_by : UUID [Пользователь или сервис, создавший запись]
+    * created_at : TIMESTAMPTZ [Время создания записи]
+  }
+}
+package "Задание и discovery" #E7F5FF {
+  entity "bulk_change_job" as bulk_change_job {
+    ' Допустимые значения колонок.
+    .. Допустимые значения ..
+    {field} job_type = CORRECTOR | JOB_ROLLBACK | TREE_RESTORE
+    {field} job_type = COPY | DELETE | EXPORT | VERSION_RETIREMENT
+    {field} status [active] = QUEUED | RUNNING | CANCEL_REQUESTED | FINALIZING
+    {field} status [terminal] = COMPLETED | COMPLETED_WITH_ERRORS
+    {field} status [terminal] = CANCELLED | FAILED
+    {field} discovery_status = PENDING | RUNNING | COMPLETE | CANCELLED | FAILED
+    {field} conflict_policy = SKIP_AND_REPORT
+    {field} actor_type = USER | SERVICE
+    {field} cancel_mode = STOP | STOP_AND_ROLLBACK
+    == Колонки ==
+    * id : UUID <<PK>> [ID длительного задания изменения, экспорта или восстановления]
+    --
+    * space_id : UUID <<FK>> [Файловое пространство, которому принадлежит запись]
+    ' Типизированная команда; перечень допустимых видов приведён выше.
+    * job_type : VARCHAR(32) [Вид массовой операции; определяет manifest и доступные действия]
+    rule_version_id : UUID <<FK>> [Версия правил; NULL для других операций или после cleanup]
+    ' Полный immutable snapshot правил/параметров, независим от шаблона.
+    * command_snapshot : JSONB [Самодостаточный неизменяемый снимок команды и параметров]
+    * command_hash : CHAR(64) [SHA-256 канонического снимка команды]
+    ' Только JOB_ROLLBACK; исходный job удерживается до завершения компенсации.
+    source_job_id : UUID <<FK>> [Исходное задание, изменения которого компенсируются]
+    retry_of_job_id : UUID <<FK>> [Исходное задание для нового запуска subset; не ссылка компенсации]
+    rollback_job_id : UUID <<FK>> [Единственная автоматическая компенсация принятого cancel-намерения]
+    ' Только TREE_RESTORE: T внутри доступного окна.
+    restore_to : TIMESTAMPTZ [Момент T для TREE_RESTORE; NULL для других заданий]
+    ' QUEUED / RUNNING / CANCEL_REQUESTED / FINALIZING /
+    ' COMPLETED / COMPLETED_WITH_ERRORS / CANCELLED / FAILED.
+    * status : VARCHAR(32) [Состояние выполнения и финализации задания]
+    ' PENDING / RUNNING / COMPLETE / CANCELLED / FAILED.
+    * discovery_status : VARCHAR(16) [Состояние обнаружения и постановки элементов в очередь]
+    ' Default SKIP_AND_REPORT; не last-writer-wins.
+    * conflict_policy : VARCHAR(32) [Политика CAS-конфликтов: пропустить и сообщить]
+    ' Лимит активных items одного job.
+    * max_parallel_items : INTEGER [Максимум одновременно выполняемых работ этого задания]
+    discovery_lease_owner : VARCHAR(128) [Worker, временно владеющий обходом целей]
+    discovery_lease_until : TIMESTAMPTZ [Срок права worker продолжать discovery]
+    * discovery_lease_token : BIGINT [Номер захвата discovery; отсекает устаревшего worker]
+    ' Кэш счётчиков, не источник истины/барьер завершения.
+    * progress_snapshot : JSONB [Кэш прогресса; не источник истины и не барьер завершения]
+    * actor_type : VARCHAR(16) [Инициатор USER или SERVICE; соответствует created_by]
+    * caller_id : VARCHAR(255) [Аутентифицированная workload identity вызывающего сервиса]
+    * correlation_id : VARCHAR(128) [Correlation ID исходной команды; не ключ идемпотентности]
+    trace_context : JSONB [Разрешённые traceparent/tracestate; без токенов и произвольного baggage]
+    * authorization_context : JSONB [Источник identity и контекст проверки; не бессрочный snapshot прав]
+    * created_by : UUID [Пользователь или сервис, создавший запись]
+    * created_at : TIMESTAMPTZ [Время создания записи]
+    started_at : TIMESTAMPTZ [Время начала выполнения]
+    discovery_finished_at : TIMESTAMPTZ [Время завершения формирования списка работ]
+    cancel_requested_at : TIMESTAMPTZ [Время принятия отмены; NULL до запроса cancel]
+    cancel_mode : VARCHAR(32) [STOP либо STOP_AND_ROLLBACK; NULL пока отмена не запрошена]
+    finished_at : TIMESTAMPTZ [Время перехода в конечное состояние]
+    ' Срок удержания base/result и деталей для компенсации.
+    rollback_available_until : TIMESTAMPTZ [До какого времени доступны версии и детали для rollback]
+    last_error_code : VARCHAR(64) [Машиночитаемый код последней ошибки]
+  }
+  entity "bulk_change_scope" as bulk_change_scope {
+    ' Допустимые значения колонок.
+    .. Допустимые значения ..
+    {field} scope_type = ROOT | EXCLUDE
+    == Колонки ==
+    * job_id : UUID <<PK,FK>> [Задание, для которого задана область; компонент PK]
+    ' Stable ID без FK: restore нужен ID уже удалённого узла.
+    * node_id : UUID <<PK>> [ID корня или исключённого узла, без FK; компонент PK]
+    ' ROOT / EXCLUDE.
+    * scope_type : VARCHAR(16) <<PK>> [Корень обхода или исключение; компонент PK]
+    --
+    ' Только отображение/аудит, не идентификатор цели.
+    display_path_snapshot : TEXT [Путь для отображения и аудита; не ID цели]
+  }
+  entity "bulk_discovery_cursor" as bulk_discovery_cursor {
+    ' Допустимые значения колонок.
+    .. Допустимые значения ..
+    {field} status = PENDING | SCANNING | COMPLETE
+    == Колонки ==
+    * job_id : UUID <<PK,FK>> [Задание обхода; компонент составного PK]
+    * folder_node_id : UUID <<PK>> [Обходимая папка; компонент составного PK]
+    --
+    ' PENDING / SCANNING / COMPLETE.
+    * status : VARCHAR(16) [Состояние постраничного обхода этой папки]
+    ' Keyset по стабильному id, не OFFSET/имени.
+    last_child_node_id : UUID [Последний обработанный ребёнок; NULL до первой страницы]
+    * updated_at : TIMESTAMPTZ [Время последнего изменения записи]
+  }
+}
+package "Пофайловая очередь" #EBFBEE {
+  entity "bulk_change_item" as bulk_change_item {
+    ' Допустимые значения колонок.
+    .. Допустимые значения ..
+    {field} operation = TRANSFORM_CONTENT | RESTORE_NODE | TRASH_NODE
+    {field} operation = COPY_NODE | COPY_CONTENT | EXPORT_ENTRY | PURGE_NODE | RETIRE_VERSION
+    {field} status [active] = WAITING_DEPENDENCY | PENDING | RUNNING | RETRY
+    {field} status [terminal] = SUCCEEDED | UNCHANGED | CONFLICT | FAILED | CANCELLED
+    == Колонки ==
+    * id : UUID <<PK>> [ID отдельной пофайловой работы]
+    --
+    * job_id : UUID <<FK>> [Задание, которому принадлежит запись]
+    ' Stable ID, включая tombstone; логическая ссылка без FK.
+    * node_id : UUID [ID цели; для COPY_NODE выделяется при discovery, для EXPORT_ENTRY — источник]
+    * operation : VARCHAR(32) [Типизированное действие; обязательные поля проверяются по operation]
+    source_node_id : UUID [Узел источника COPY; логический ID без FK для retention]
+    source_space_id : UUID <<FK>> [Пространство источника COPY; может отличаться от job.space_id]
+    source_version_id : UUID <<FK>> [Зафиксированная версия источника COPY; NULL для папки]
+    target_parent_id : UUID [Папка назначения COPY_NODE; логический ID, включая ещё не созданную копию]
+    target_name : VARCHAR(255) [Имя создаваемого узла COPY_NODE]
+    archive_entry_path : TEXT [Уникальный безопасный относительный путь записи ZIP; только EXPORT_ENTRY]
+    ' Снимок при discovery; NULL для папки.
+    base_version_id : UUID <<FK>> [Версия на момент discovery; NULL для папки]
+    expected_content_revision : BIGINT [Ожидаемый номер содержимого перед публикацией; CAS]
+    ' CAS структуры только для операций над структурой.
+    expected_node_revision : BIGINT [Ожидаемый номер metadata перед структурной операцией]
+    ' Желаемые name/parent/status для restore.
+    target_state : JSONB [Целевые parent, name и status для восстановления узла]
+    before_state : JSONB [Минимальные metadata до изменения; признак отсутствия узла для новой копии]
+    target_version_id : UUID <<FK>> [Версия для RESTORE_NODE, EXPORT_ENTRY либо RETIRE_VERSION]
+    ' Результат upload для retry после сбоя.
+    staged_version_id : UUID <<FK>> [Подготовленная версия для безопасного повтора после сбоя]
+    result_version_id : UUID <<FK>> [Версия, опубликованная этой работой]
+    ' Состояние структуры после commit; нужно для CAS её компенсации.
+    result_node_revision : BIGINT [Номер metadata после commit; CAS при компенсации]
+    result_content_revision : BIGINT [Номер содержимого после commit; CAS для компенсации байтов]
+    ' Исходный item компенсации; SET NULL только после безопасного retention.
+    source_item_id : UUID <<FK>> [Исходная работа, изменения которой компенсируются]
+    retry_of_item_id : UUID <<FK>> [Элемент исходного job, повторяемый новым subset-запуском]
+    ' WAITING_DEPENDENCY / PENDING / RUNNING / RETRY /
+    ' SUCCEEDED / UNCHANGED / CONFLICT / FAILED / CANCELLED.
+    * status : VARCHAR(32) [Состояние выполнения и пофайловый итог]
+    * attempt : INTEGER [Счётчик попыток выполнения, включая повторы]
+    * next_attempt_at : TIMESTAMPTZ [Не раньше этого времени разрешена следующая попытка]
+    lease_owner : VARCHAR(128) [Worker, временно получивший задачу в обработку]
+    lease_until : TIMESTAMPTZ [Срок действия права worker на обработку задачи]
+    ' Растёт при claim; старый worker не сможет выполнить commit.
+    * lease_token : BIGINT [Номер захвата; запрещает commit устаревшего worker]
+    * processed_bytes : BIGINT [Счётчик обработанных байтов для прогресса работы]
+    error_code : VARCHAR(64) [Машиночитаемый код последней ошибки]
+    ' Ограниченная/очищенная ошибка без содержимого и секретов.
+    error_message : TEXT [Безопасное описание ошибки; без содержимого и секретов]
+    * created_at : TIMESTAMPTZ [Время создания записи]
+    started_at : TIMESTAMPTZ [Время начала обработки пофайловой работы]
+    finished_at : TIMESTAMPTZ [Время перехода в конечное состояние]
+  }
+  entity "bulk_item_dependency" as bulk_item_dependency {
+    * item_id : UUID <<PK,FK>> [Зависимая работа, ожидающая prerequisite; компонент PK]
+    * depends_on_item_id : UUID <<PK,FK>> [Работа, которая должна завершиться раньше; компонент PK]
+    --
+    ' DAG: родитель до ребёнка; удаления в обратном порядке.
+    ' Ошибка prerequisite терминально завершает dependent item.
+  }
+}
+
+corrector_rule_set ||--o{ corrector_rule_version : immutable revisions
+corrector_rule_version |o--o{ bulk_change_job : rule_version_id
+bulk_change_job |o--o{ bulk_change_job : source_job_id
+bulk_change_job |o--o{ bulk_change_job : retry_of_job_id
+bulk_change_job |o--o| bulk_change_job : automatic rollback_job_id
+bulk_change_job ||--|{ bulk_change_scope : scope
+bulk_change_job ||--o{ bulk_discovery_cursor : paged discovery
+bulk_change_job ||--o{ bulk_change_item : durable manifest
+bulk_change_item |o--o{ bulk_change_item : compensation
+bulk_change_item |o--o{ bulk_change_item : retry lineage
+bulk_change_item ||--o{ bulk_item_dependency : item / prerequisite
+
+/' note bottom of bulk_discovery_cursor
+  Страница items + child cursors + checkpoint пишутся одной TX.
+  Пересекающиеся ROOT нормализуются.
+  UNIQUE(job_id,node_id,operation) WHERE operation <> 'RETIRE_VERSION'.
+  UNIQUE(job_id,target_version_id) WHERE operation='RETIRE_VERSION'.
+  UNIQUE(job_id,source_node_id) WHERE operation='COPY_NODE'.
+  COPY_NODE заранее получает target node_id; повтор discovery находит тот же item/ID.
+  Child copy item ссылается на выделенный target parent ID и ждёт parent dependency.
+  Для COPY разные source spaces имеют раздельные source holds и ACL.
+  Discovery не собирает все пути в RAM.
+  Current scope и нормализация ROOT/EXCLUDE используют ltree папок; FILE — JOIN на parent.
+  Иерархия на T строится из исторических parent_node_id, не текущего tree_path.
+  Снимок пофайловый при обнаружении, не глобальный на момент старта.
+  Новые/перемещённые во время обхода файлы могут не попасть в job.
+'/
+/' note bottom of bulk_change_item
+  Claim: TX SELECT FOR UPDATE SKIP LOCKED + lease/token, COMMIT.
+  S3/transform вне TX; heartbeat продлевает только свой lease/token.
+  Commit проверяет lease/token, base version и content_revision.
+  Для структуры — expected_node_revision; CONFLICT не затирает файл.
+  COPY_CONTENT: source_version_id — источник, base_version_id — старая версия назначения.
+  COPY_CONTENT сохраняет node_id назначения и публикует новую file_version origin=COPY.
+  COPY_NODE создаёт новый node_id; папка и FILE имеют разные требования к version fields.
+  Новая FOLDER: tree_path = destination parent.tree_path || label(node_id); FILE: NULL.
+  Prefix источника не переносится; путь вычисляется под structural space lock.
+  same-space COPY может разделять immutable object; cross-space создаёт отдельное размещение.
+  source version принадлежит source node/space; base/result относятся к node_id/job.space_id.
+  target parent находится в destination space; циклы и собственное поддерево запрещены.
+  COPY_NODE требует source_node_id/source_space_id/target_parent_id/target_name/before_state.
+  COPY FILE требует source_version_id; COPY FOLDER не имеет content source version.
+  EXPORT_ENTRY: node_id — исходный узел job.space_id, target_version_id — manifest version.
+  EXPORT_ENTRY требует archive_entry_path; абсолютные пути, '..' и дубли запрещены.
+  UNIQUE(job_id,archive_entry_path) WHERE operation='EXPORT_ENTRY'; лимиты пути проверяются.
+  EXPORT_ENTRY success не завершает job: нужен export_artifact READY и полный manifest.
+  RETIRE_VERSION требует target_version_id этого node_id; current/holds/retention не обходятся.
+  PURGE_NODE не означает немедленное удаление S3: проверяются history/holds и durable gc_task.
+  before_state типизирован по operation; содержит metadata, но не байты и не копию дерева.
+  retry_of_item_id принадлежит retry_of_job_id; source_item_id принадлежит source_job_id.
+  UNIQUE(job_id,retry_of_item_id) WHERE retry_of_item_id IS NOT NULL.
+  Commit атомарен: current pointer + node_revision + item + audit + index task.
+  Контентная публикация — shared space lock; структурная — exclusive с начала TX.
+  COPY_NODE/TRASH/RESTORE/PURGE повышают authorization_revision при изменении namespace.
+  Retry не создаёт повторно опубликованную версию.
+  INDEX(next_attempt_at,id) WHERE status IN ('PENDING','RETRY').
+  INDEX(lease_until) WHERE status='RUNNING'; INDEX(job_id,status).
+  Claim учитывает job status; лимит параллелизма резервируется атомарно.
+  CHECK attempt >= 0, lease_token >= 0, processed_bytes >= 0.
+'/
+/' note bottom of bulk_change_job
+  Запуск без подтверждения; пересекающиеся roots разрешены.
+  actor_type = USER | SERVICE. correlation_id сохраняется атомарно с job.
+  Worker проверяет текущие ACL, ACTIVE роли и актуальность внешнего назначения.
+  Истёкший/непроверяемый identity-контекст запрещает публикацию (fail closed).
+  Обновление membership/делегирования требует отдельного доверенного протокола.
+  Worker commit берёт shared lock job и проверяет RUNNING.
+  Cancel берёт exclusive lock и ставит CANCEL_REQUESTED:
+  после commit cancel новые изменения больше не публикуются.
+  STOP сохраняет уже опубликованные изменения.
+  STOP_AND_ROLLBACK сохраняет durable intent; компенсация — отдельное задание.
+  CHECK cancel_mode IS NULL ровно когда cancel_requested_at IS NULL.
+  Принятый cancel_mode неизменяем; повтор того же mode идемпотентен, другой — конфликт.
+  Finalizer/reconciler после остановки создаёт JOB_ROLLBACK и записывает rollback_job_id
+  одной TX под exclusive lock исходного job; повтор использует существующую связь.
+  UNIQUE(rollback_job_id) WHERE rollback_job_id IS NOT NULL; job не ссылается на себя.
+  Linked rollback.source_job_id = исходный job.id, общий space, тип JOB_ROLLBACK.
+  Ручные rollback не занимают поле автоматической компенсации cancel.
+  Если admission компенсации отложен, intent и holds сохраняются до запуска.
+  EXPORT, VERSION_RETIREMENT и DELETE/PURGE не допускают STOP_AND_ROLLBACK.
+  Сам JOB_ROLLBACK не создаёт бесконечную цепочку авто-компенсаций.
+  Finalizer: discovery COMPLETE + нет нетерминальных items,
+  атомарный RUNNING -> FINALIZING -> итоговый статус.
+  Cancel останавливает discovery, отменяет невыполненные items
+  и завершает leases; итог CANCELLED с частичным результатом.
+  FAILED discovery завершает job с учётом уже сделанных изменений.
+  Progress считается из items; кэш counters не барьер финализации.
+  CHECK max_parallel_items > 0; CHECK полей по job_type.
+  source_job_id только для JOB_ROLLBACK; retry_of_job_id не заменяет source_job_id.
+  Retry job имеет тот же job_type и space, новый immutable command_snapshot и actor context.
+  EXPORT не допускает subset retry: повтор сборки использует полный исходный manifest.
+  Связи retry/source не образуют циклов; cleanup не разрывает живую компенсацию.
+  Для VERSION_RETIREMENT command snapshot содержит bounded selection версий, не raw S3 keys.
+  Для COPY job.space_id — destination; source spaces явно указаны в items/command snapshot.
+  Для EXPORT terminal success требует READY artifact, а не только terminal items.
+  INDEX(retry_of_job_id), INDEX(source_job_id); retention учитывает связанные live jobs.
+  corrector_rule_set.revision >= 1; CAS UPDATE revision=expected, revision=revision+1.
+  UNIQUE(rule_set_id,version_number) у corrector_rule_version.
+  У rule_version_id ON DELETE SET NULL: command_snapshot самодостаточен.
+'/
+/' note right of bulk_item_dependency
+  JOB_ROLLBACK берёт исходные SUCCEEDED items.
+  Компенсация только если current version = исходный result_version;
+  также проверяются result_content_revision и metadata revision/состояние по операции.
+  COPY_NODE компенсация убирает только созданные job узлы без чужих изменений/children.
+  Dependencies компенсации обратные: children раньше parent; конфликт child защищает parent.
+  COPY_CONTENT восстанавливает base bytes новой версией; чужие последующие edits сохраняются.
+  Иначе ROLLBACK_CONFLICT.
+  TREE_RESTORE читает node_revision на T, создаёт новые состояния/версии.
+  Родители восстанавливаются первыми; история не удаляется.
+  tree_path вычисляется из текущего parent, в before_state исторический prefix не используется.
+  Структурный restore/rollback папки атомарно переписывает prefix её текущих вложенных папок.
+  При превышении maxAtomicMoveFolders — FAILED/RESOURCE_LIMIT_EXCEEDED без изменения структуры.
+  Move вне scope и коллизии имён возвращают CONFLICT.
+'/
+@enduml

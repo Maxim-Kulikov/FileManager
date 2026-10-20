@@ -1,0 +1,148 @@
+' operationId: createUploadSession
+' method: POST
+' path: /api/v1/spaces/{spaceId}/uploads
+' Общие правила REQ, ACL, IDEMP, ERR: README.md.
+@startuml createUploadSession_AD
+title Создание сессии загрузки\nPOST /sprut-file-manager/api/v1/spaces/{spaceId}/uploads
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam partitionBorderColor #7950F2
+skinparam partitionBackgroundColor #F3F0FF
+skinparam activityBackgroundColor #E7F5FF
+|SPRUT-FILE-MANAGER|
+start
+:Request;
+note right
+  Request: POST /sprut-file-manager/api/v1/spaces/{spaceId}/uploads
+  Path:
+    spaceId*
+  Headers:
+    Idempotency-Key*, X-Actor-Id*, X-Actor-Type*, X-Actor-Roles?
+    X-Actor-Groups?, X-Correlation-Id?, traceparent?, tracestate?
+  Content-Type*: application/json
+  Body:
+    NEW:
+      mode*, parentId*, name*, expectedSizeBytes? (null), expectedChecksumSha256?
+      contentType*, charset?
+    mode = NEW
+    UPDATE:
+      mode*, fileNodeId*, expectedContentRevision*, baseVersionId* (null)
+      expectedSizeBytes? (null), expectedChecksumSha256?, contentType*, charset?
+    mode = UPDATE
+  Обозначения: * обязательное, ? необязательное, (null) допускает null
+end note
+:Получить spaceId, mode, contentType, charset,
+expectedSizeBytes, expectedChecksumSha256 и Idempotency-Key.
+NEW: parentId, name. UPDATE: fileNodeId,
+baseVersionId, expectedContentRevision;
+if (expectedSizeBytes задан и > maxFileBytes?) then (да)
+  :Ответ 413 REQUEST_BODY_TOO_LARGE;
+  stop
+endif
+if (MIME/charset или нормализованное имя недопустимы?) then (да)
+  :Ответ 422 VALIDATION_ERROR;
+  stop
+endif
+:Вычислить scope = tenant + actor + createUpload + spaceId
+и request_hash канонической команды;
+partition "TX — создание session, READ COMMITTED" {
+:BEGIN. Найти storage_space s по id = spaceId
+и tenant_id = configuredTenantId FOR SHARE;
+if (Пространство не найдено?) then (да)
+  :ROLLBACK. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (s.status = DISABLED?) then (да)
+  :ROLLBACK. Ответ 403 SPACE_DISABLED;
+  stop
+endif
+if (s.status = READ_ONLY?) then (да)
+  :ROLLBACK. Ответ 403 SPACE_READ_ONLY;
+  stop
+endif
+if (mode = NEW?) then (да)
+  :Найти fs_node target по id = parentId и space_id = spaceId;
+else (UPDATE)
+  :Найти fs_node target по id = fileNodeId и space_id = spaceId;
+endif
+if (target не найден?) then (да)
+  :ROLLBACK. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+:Получить предков target и grants по ACL;
+if (target или предок не ACTIVE?) then (да)
+  :ROLLBACK. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (Нет видимости предков?) then (да)
+  :ROLLBACK. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (Нет WRITE для target?) then (да)
+  :ROLLBACK. Ответ 403 ACCESS_DENIED;
+  stop
+endif
+if (Тип target не соответствует mode?) then (да)
+  :ROLLBACK. Ответ 422 NODE_TYPE_MISMATCH;
+  stop
+endif
+note right
+  NEW требует FOLDER.
+  UPDATE требует FILE.
+end note
+:INSERT idempotency_record по scope + key ON CONFLICT DO NOTHING.
+При конфликте прочитать запись FOR UPDATE;
+if (Существующая команда имеет другой request_hash?) then (да)
+  :ROLLBACK. Ответ 409 IDEMPOTENCY_KEY_REUSED;
+  stop
+endif
+if (Есть сохранённый ответ?) then (да)
+  :Найти upload_session по resource_id, проверить replay по IDEMP;
+  if (Результат истёк или session физически удалена?) then (да)
+    :ROLLBACK. Ответ 410 IDEMPOTENCY_RESULT_EXPIRED;
+    stop
+  endif
+  :COMMIT без новой session. Ответ 201 с сохранённым Upload;
+  stop
+endif
+if (mode = UPDATE?) then (да)
+  :Прочитать file_entry по node_id = fileNodeId FOR UPDATE;
+  if (current_version_id IS DISTINCT FROM baseVersionId\nили content_revision != expectedContentRevision?) then (да)
+    :ROLLBACK. Ответ 409 CONTENT_REVISION_MISMATCH;
+    stop
+  endif
+endif
+:INSERT upload_session: новый id, space_id,
+target_parent_id/requested_name для NEW,
+file_node_id/base_version_id/expected_content_revision для UPDATE,
+MIME/charset, expected size/checksum,
+status = INITIATED, revision = 1, created_by = actorId,
+current_attempt_id = result_version_id = NULL,
+created_at = txTime, expires_at = txTime + uploadSessionTtl;
+:Сохранить idempotency_record:
+resource_id = uploadId, response_status = 201, response_body = Upload;
+:COMMIT;
+}
+:Ответ 201 Upload;
+note right
+Response
+201:
+  Headers:
+    Location, X-Correlation-Id
+  Content-Type: application/json
+  Body: Upload
+    id*, spaceId*, status*, parentId? (null), fileNodeId? (null)
+    expectedSizeBytes* (null), uploadedBytes*, resultVersionId? (null), expiresAt*
+    createdAt*, errorCode? (null), transferStatus*, attemptNumber*
+Ошибки: application/problem+json
+  type*, title*, status*, code*, detail?, instance?, requestId*, violations?[]
+  correlationId*, traceId? (null)
+  violations?[]: field*, code*, message*
+Обозначения: * обязательное, ? необязательное, (null) допускает null
+
+  Здесь нет MinIO I/O, content_object и нового fs_node.
+  Имя NEW повторно проверяется при публикации.
+  UPDATE placeholder допускает только NULL base и revision = 0.
+end note
+stop
+@enduml

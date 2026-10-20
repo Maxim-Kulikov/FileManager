@@ -1,0 +1,179 @@
+' operationId: moveNode
+' method: POST
+' path: /api/v1/nodes/{nodeId}/move
+' Общие правила REQ, ACL, IDEMP, HIST, INDEX, ERR: README.md.
+@startuml moveNode_AD
+title Перемещение узла\nPOST /sprut-file-manager/api/v1/nodes/{nodeId}/move
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam partitionBorderColor #7950F2
+skinparam partitionBackgroundColor #F3F0FF
+skinparam activityBackgroundColor #E7F5FF
+|SPRUT-FILE-MANAGER|
+start
+:Request;
+note right
+  Request: POST /sprut-file-manager/api/v1/nodes/{nodeId}/move
+  Path:
+    nodeId*
+  Headers:
+    If-Match*, Idempotency-Key*, X-Actor-Id*, X-Actor-Type*, X-Actor-Roles?
+    X-Actor-Groups?, X-Correlation-Id?, traceparent?, tracestate?
+  Content-Type*: application/json
+  Body:
+    targetParentId*, name?
+  Обозначения: * обязательное, ? необязательное, (null) допускает null
+end note
+:Получить nodeId, targetParentId, optional name,
+If-Match и Idempotency-Key;
+if (If-Match отсутствует?) then (да)
+  :Ответ 428 VALIDATION_ERROR;
+  stop
+endif
+:Нормализовать переданное name.
+scope = tenant + actor + moveNode + nodeId.
+request_hash = SHA-256 targetParentId, optional name и If-Match;
+:Read snapshot: найти source fs_node по nodeId,
+его storage_space по configuredTenantId,
+target fs_node по targetParentId и видимость обеих цепочек;
+if (Source или target не найдены либо скрыты ACL?) then (да)
+  :Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (source.space_id != target.space_id?) then (да)
+  :Ответ 409 INVALID_MOVE;
+  stop
+endif
+:Сохранить generation = space.authorization_revision.
+При FOLDER и смене parent посчитать папки по старому tree_path,
+включая source и TRASHED/PURGING, до maxAtomicMoveFolders + 1.
+При увеличении depth или длины logical path пакетно проверить
+затрагиваемые узлы вне изменяющей TX. Preflight относится к одной generation;
+partition "TX — перемещение узла, READ COMMITTED" {
+:BEGIN. storage_space по source.space_id FOR UPDATE.
+Повторно прочитать source/target и их предков;
+if (Source или target исчезли после первоначального поиска?) then (да)
+  :ROLLBACK. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (Source, target или предок не ACTIVE?) then (да)
+  :ROLLBACK. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+:Получить актуальные grants по ACL;
+if (Нет видимости source/target цепочек?) then (да)
+  :ROLLBACK. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (space.status = DISABLED?) then (да)
+  :ROLLBACK. Ответ 403 SPACE_DISABLED;
+  stop
+endif
+if (space.status = READ_ONLY?) then (да)
+  :ROLLBACK. Ответ 403 SPACE_READ_ONLY;
+  stop
+endif
+if (Нет WRITE + DELETE для source или WRITE для target?) then (да)
+  :ROLLBACK. Ответ 403 ACCESS_DENIED;
+  stop
+endif
+:INSERT idempotency_record по scope + key ON CONFLICT DO NOTHING.
+При конфликте прочитать запись FOR UPDATE;
+if (Сохранённый request_hash отличается?) then (да)
+  :ROLLBACK. Ответ 409 IDEMPOTENCY_KEY_REUSED;
+  stop
+endif
+if (Есть сохранённый ответ?) then (да)
+  if (Результат истёк или физически удалён?) then (да)
+    :ROLLBACK. Ответ 410 IDEMPOTENCY_RESULT_EXPIRED;
+    stop
+  endif
+  :COMMIT без переноса. Ответ 200 с сохранённым Node;
+  stop
+endif
+if (If-Match не соответствует source.revision?) then (да)
+  :ROLLBACK. Ответ 412 REVISION_MISMATCH;
+  stop
+endif
+if (source.parent_id IS NULL?) then (да)
+  :ROLLBACK. Ответ 409 INVALID_MOVE;
+  stop
+endif
+if (target.node_type != FOLDER?) then (да)
+  :ROLLBACK. Ответ 422 NODE_TYPE_MISMATCH;
+  stop
+endif
+if (target.id = source.id или FOLDER source содержит target по tree_path?) then (да)
+  :ROLLBACK. Ответ 409 INVALID_MOVE;
+  stop
+endif
+if (Использован preflight и authorization_revision != generation?) then (да)
+  :ROLLBACK. Ответ 409 REVISION_MISMATCH;
+  stop
+endif
+if (FOLDER меняет parent и число папок > maxAtomicMoveFolders?) then (да)
+  :ROLLBACK. Ответ 413 RESOURCE_LIMIT_EXCEEDED,
+  violations.targetParentId с причиной превышения лимита;
+  stop
+endif
+:newName = name из команды, иначе source.name.
+Рассчитать depth и максимальную длину пути после переноса;
+if (Будут превышены maxDepth или maxPathLength?) then (да)
+  :ROLLBACK. Ответ 422 VALIDATION_ERROR;
+  stop
+endif
+if (parent_id = targetParentId и name = newName?) then (да)
+  :Сохранить idempotency response = текущий Node.
+  COMMIT. Ответ 200 без новой revision/history;
+  stop
+endif
+if (source.node_type = FOLDER и parent меняется?) then (да)
+  :oldPrefix = source.tree_path.
+  newPrefix = target.tree_path || label(source.id).
+  UPDATE всех FOLDER в space со tree_path <@ oldPrefix,
+  включая TRASHED/PURGING: заменить prefix, suffix сохранить.
+  Для source установить newPrefix без пустого subpath.
+  Вложенным папкам не менять revision, updated_at и историю;
+endif
+:UPDATE fs_node source:
+parent_id = targetParentId, name = newName, normalized_name,
+revision += 1, search_revision += 1, updated_at = txTime;
+if (Нарушен UNIQUE активного sibling name?) then (да)
+  :ROLLBACK. Ответ 409 NAME_COLLISION;
+  stop
+endif
+:Закрыть прошлую node_revision, INSERT новую по HIST.
+UPDATE storage_space: authorization_revision += 1.
+INSERT audit_event action = MOVE.
+UPSERT search_index_task SUBTREE по INDEX;
+:Сохранить idempotency response_status = 200,
+resource_id = nodeId, response_body = Node;
+:COMMIT;
+}
+:Ответ 200 Node и metadata ETag;
+note right
+Response
+200:
+  Headers:
+    ETag, X-Correlation-Id
+  Content-Type: application/json
+  Body: Node
+    id*, spaceId*, parentId* (null), type*, name*, path*, markers*, revision*
+    status*, createdAt*, updatedAt*, trashedAt? (null), file?
+    file (только FILE):
+      currentVersionId* (null), contentRevision*, sizeBytes* (null)
+      contentType* (null), checksumSha256* (null)
+Ошибки: application/problem+json
+  type*, title*, status*, code*, detail?, instance?, requestId*, violations?[]
+  correlationId*, traceId? (null)
+  violations?[]: field*, code*, message*
+Обозначения: * обязательное, ? необязательное, (null) допускает null
+
+  nodeId и содержимое сохраняются.
+  S3 copy/delete не выполняются.
+  tree_path источника и всех вложенных папок изменены в одной TX.
+  У FILE tree_path = NULL; строки файлов потомков не обновляются.
+  Между пакетами UPDATE папок нет COMMIT.
+end note
+stop
+@enduml

@@ -1,0 +1,167 @@
+' PostgreSQL — источник истины и очередь работ; S3 — неизменяемые байты.
+' Каждый .puml содержит одну самостоятельную диаграмму.
+' Обзор: sprut-file-manager-db.puml.
+' Детали: sprut-file-manager-db-{namespace,content,bulk,retention,search-audit,administration}.puml.
+' Пояснения [в скобках] видны на диаграмме; подробные comments и ограничения — в исходнике.
+' <<ref>> — таблица подробно описана в другом файле; это не новая таблица.
+' Ограничения CHECK/FK/UNIQUE и индексы указаны в комментариях.
+
+@startuml sprut-file-manager-db-search-audit
+title sprut-file-manager — PostgreSQL задачи индексации, аудит и идемпотентность
+hide methods
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam nodesep 100
+skinparam ranksep 140
+skinparam padding 2
+skinparam ArrowFontSize 12
+
+entity "search_index_task" as search_index_task #E7F5FF {
+  ' Допустимые значения колонок.
+  .. Допустимые значения ..
+  {field} task_scope = NODE | SUBTREE
+  {field} action = UPSERT | TOMBSTONE
+  {field} status = PENDING | RUNNING | RETRY | DONE | FAILED
+  == Колонки ==
+  * space_id : UUID <<PK,FK>> [Пространство цели; компонент составного PK]
+  ' Без FK: delete task переживает физический purge узла.
+  * node_id : UUID <<PK>> [Целевой узел без FK для purge; компонент составного PK]
+  ' NODE / SUBTREE; после move/rename SUBTREE раскрывается в NODE tasks.
+  * task_scope : VARCHAR(16) <<PK>> [Узел или поддерево; компонент составного PK]
+  --
+  ' UPSERT / TOMBSTONE; metadata/ACL берутся из PostgreSQL.
+  * action : VARCHAR(16) [Обновить документ либо записать tombstone]
+  ' Для NODE = fs_node.search_revision; UPSERT только увеличивает значение.
+  * desired_revision : BIGINT [Номер проекции, которую нужно довести до OpenSearch]
+  ' Revision, взятая worker, для обнаружения обновлений во время I/O.
+  processing_revision : BIGINT [Номер проекции, взятой worker; NULL до захвата]
+  ' PENDING / RUNNING / RETRY / DONE / FAILED.
+  * status : VARCHAR(16) [Состояние обработки задачи индексации]
+  * attempt : INTEGER [Счётчик попыток выполнения, включая повторы]
+  * next_attempt_at : TIMESTAMPTZ [Не раньше этого времени разрешена следующая попытка]
+  lease_owner : VARCHAR(128) [Worker, временно получивший задачу в обработку]
+  lease_until : TIMESTAMPTZ [Срок действия права worker на обработку задачи]
+  * lease_token : BIGINT [Номер захвата; запрещает commit устаревшего worker]
+  error_code : VARCHAR(64) [Машиночитаемый код последней ошибки]
+  * updated_at : TIMESTAMPTZ [Время последнего изменения записи]
+  completed_at : TIMESTAMPTZ [Время завершения обработки взятой revision]
+}
+entity "search_index_cursor" as search_index_cursor #E7F5FF {
+  ' Допустимые значения колонок.
+  .. Допустимые значения ..
+  {field} task_scope = SUBTREE
+  {field} status = PENDING | SCANNING | COMPLETE
+  == Колонки ==
+  * space_id : UUID <<PK,FK>> [Пространство родительской задачи; компонент PK и FK]
+  * root_node_id : UUID <<PK,FK>> [Корень родительской задачи SUBTREE; компонент PK и FK]
+  * task_scope : VARCHAR(16) <<PK,FK>> [Всегда SUBTREE; компонент PK и FK на задачу]
+  * folder_node_id : UUID <<PK>> [Папка текущего обхода; компонент составного PK]
+  --
+  ' task_scope всегда SUBTREE: этот cursor используется только для обхода поддерева.
+  ' Composite FK первых трёх полей на search_index_task, не на fs_node.
+  ' Поколение раскрытия SUBTREE; изменение desired_revision запускает новый проход.
+  * task_revision : BIGINT [Поколение обхода; новая revision требует нового прохода]
+  ' PENDING / SCANNING / COMPLETE.
+  * status : VARCHAR(16) [Состояние постраничного обхода папки для индексации]
+  last_child_node_id : UUID [Последний обработанный ребёнок; NULL до первой страницы]
+  * updated_at : TIMESTAMPTZ [Время последнего изменения записи]
+}
+entity "audit_event" as audit_event #FFF9DB {
+  ' Допустимые значения колонок.
+  .. Допустимые значения ..
+  {field} action = CREATE | RENAME | MOVE | TRASH | RESTORE
+  {field} action = VERSION_CREATE | GC_PURGE | ACL_CHANGE | MARKERS_CHANGE
+  {field} action = ROLE_CHANGE | RETENTION_CHANGE | UPDATE
+  {field} action = COPY | EXPORT | JOB_CANCEL | JOB_RETRY | VERSION_RETIRE
+  {field} actor_type = USER | SERVICE
+  {field} resource_type = SPACE | NODE | FILE_VERSION | ROLE
+  {field} resource_type = RETENTION_POLICY | JOB | UPLOAD | SERVICE_SETTINGS
+  {field} resource_type = EXPORT_ARTIFACT
+  == Колонки ==
+  ' Append-only внутри retention; для partitioning PK включает occurred_at.
+  * occurred_at : TIMESTAMPTZ <<PK>> [Время события и ключ партиционирования; компонент PK]
+  * id : UUID <<PK>> [ID события; вместе с occurred_at образует один PK]
+  --
+  ' Логические ID без FK на очищаемые domain rows.
+  * tenant_id : UUID [Tenant из конфигурации; событие не зависит от наличия space]
+  * resource_type : VARCHAR(32) [Тип изменяемого ресурса; значения выше]
+  * resource_id : UUID [Логический ID ресурса; без блокирующего cleanup FK]
+  space_id : UUID [NULL для административного события до создания первого space]
+  node_id : UUID [Логический ID затронутого узла; без FK]
+  version_id : UUID [Логический ID затронутой версии; без FK]
+  operation_id : UUID [Логический ID операции, породившей событие; без FK]
+  item_id : UUID [Логический ID пофайловой работы; без FK]
+  ' CREATE / RENAME / MOVE / VERSION_CREATE / TRASH / RESTORE / GC_PURGE / ACL_CHANGE.
+  * action : VARCHAR(64) [Вид зафиксированного изменения]
+  actor_id : UUID [Пользователь или сервис, выполнивший действие]
+  actor_type : VARCHAR(16) [USER или SERVICE; NULL для legacy без identity]
+  caller_id : VARCHAR(255) [Аутентифицированный вызывающий сервис; без секретов]
+  correlation_id : VARCHAR(128) [Correlation ID события и исходной команды]
+  trace_id : VARCHAR(32) [Трассировка при наличии; не заменяет correlation_id]
+  span_id : VARCHAR(16) [Операция внутри trace при наличии]
+  request_id : VARCHAR(128) [Legacy диагностическое поле; не источник identity]
+  ' Минимальное metadata; не байты файлов/копия дерева.
+  before_state : JSONB [Минимальные metadata до изменения; не байты файла]
+  after_state : JSONB [Минимальные metadata после изменения; не копия дерева]
+}
+entity "idempotency_record" as idempotency_record #F3F0FF {
+  ' Включает configured tenant + actor_type + actor_id + operation + resource.
+  * scope : VARCHAR(255) <<PK>> [Граница tenant, actor и операции; компонент составного PK]
+  * idempotency_key : VARCHAR(255) <<PK>> [Ключ повтора от клиента внутри scope; компонент PK]
+  --
+  * request_hash : CHAR(64) [SHA-256 запроса; тот же ключ с иным запросом запрещён]
+  ' Логический ID resource без FK.
+  resource_id : UUID [ID созданного ресурса или задания; логическая ссылка]
+  response_status : INTEGER [HTTP-статус сохранённого результата]
+  response_body : JSONB [Минимальное тело ответа для повторного запроса]
+  * created_at : TIMESTAMPTZ [Время создания записи]
+  * expires_at : TIMESTAMPTZ [До какого момента хранится результат для replay]
+}
+entity "fs_node" as fs_node <<ref>> #E7F5FF
+entity "OpenSearch" as opensearch #FFF9DB
+
+fs_node ..> search_index_task : same DB transaction
+fs_node ..> audit_event : same DB transaction
+search_index_task ||--o{ search_index_cursor : durable subtree traversal
+search_index_task ..> opensearch : PostgreSQL worker
+
+/' note bottom of search_index_task
+  INDEX(next_attempt_at) WHERE status IN ('PENDING','RETRY').
+  Claim/retry: SKIP LOCKED + leases.
+  Domain change + INSERT/UPSERT task атомарно, Kafka не нужен.
+  DONE только если desired_revision = processing_revision.
+  Новая revision во время I/O требует следующего прохода.
+  SUBTREE использует search_index_cursor, как discovery;
+  checkpoint и создание NODE tasks атомарны.
+  Для потомка bump search_revision + UPSERT NODE task в одной TX.
+  Worker удерживает читаемую версию через INDEX_READ hold до конца S3 I/O.
+  Periodic reconciliation восстанавливает индекс из PostgreSQL.
+'/
+/' note bottom of opensearch
+  Документ = space_id + node_id; текущее содержимое, без истории версий.
+  markers включены в текущую metadata projection как массив кодов.
+  API возвращает актуальные markers из fs_node, не из stale search document.
+  search_revision защищает от устаревшей записи (external version).
+  TOMBSTONE с revision предотвращает позднее воскрешение документа.
+  Physical tombstone purge только после исключения старых writers/retries;
+  rebuild с новым поколением индекса позволяет убрать их целиком.
+  Старые legacy version-documents чистятся адресными gc_task.
+  Rebuild читает PostgreSQL + current bytes, затем меняет alias.
+  Search results проходят актуальную авторизацию в File Manager.
+  Upload attempts и ZIP artifacts не индексируются как пользовательские fs_node.
+  COPY_NODE индексирует новые IDs; COPY_CONTENT обновляет revision существующего файла.
+  Catalog roles/permissions и effective permissions не читаются из OpenSearch.
+'/
+/' note bottom of audit_event
+  Partitioning по occurred_at; cleanup по audit_retention_days.
+  Для событий без space действует обязательная service-level audit retention
+  из внешней конфигурации; отсутствие spaces не означает бессрочное хранение.
+  SPACE/NODE/ROLE события имеют scope space; начальная policy может не иметь space.
+  YAML secrets/endpoints не копируются в audit; изменение инфраструктуры фиксирует deployment audit.
+  Старые партиции удаляются/архивируются после retention.
+  Job/item cleanup пакетный, с INDEX(finished_at).
+  COPY/EXPORT/cancel/retry/version retirement аудируются в TX принятия команды или публикации.
+  before/after содержит IDs и безопасные metadata, не manifest целиком и не байты архива.
+  Partitioning очередей отдельно согласует PK/FK/UNIQUE.
+'/
+@enduml

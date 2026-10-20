@@ -1,0 +1,89 @@
+' operationId: getNode
+' method: GET
+' path: /api/v1/nodes/{nodeId}
+' Общие правила REQ, ACL, ERR: README.md.
+@startuml getNode_AD
+title Получение файла или папки\nGET /sprut-file-manager/api/v1/nodes/{nodeId}
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam partitionBorderColor #7950F2
+skinparam partitionBackgroundColor #F3F0FF
+skinparam activityBackgroundColor #E7F5FF
+|SPRUT-FILE-MANAGER|
+start
+:Request;
+note right
+  Request: GET /sprut-file-manager/api/v1/nodes/{nodeId}
+  Path:
+    nodeId*
+  Headers:
+    If-None-Match?, X-Actor-Id*, X-Actor-Type*, X-Actor-Roles?, X-Actor-Groups?
+    X-Correlation-Id?, traceparent?, tracestate?
+  Body: отсутствует
+  Обозначения: * обязательное, ? необязательное, (null) допускает null
+end note
+:Получить nodeId и If-None-Match из запроса;
+partition "TX — PostgreSQL, REPEATABLE READ (read-only)" {
+:Начать read-only TX REPEATABLE READ;
+:Найти fs_node n по id = nodeId,
+storage_space s по id = n.space_id
+и tenant_id = configuredTenantId;
+if (Узел не найден?) then (да)
+  :Завершить TX. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+:Получить предков n из tree_path папки либо её parent для FILE
+по TREE и grants по правилу ACL;
+if (n.status != ACTIVE или предок не ACTIVE?) then (да)
+  :Завершить TX. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (s.status = DISABLED?) then (да)
+  :Завершить TX. Ответ 403 SPACE_DISABLED;
+  stop
+endif
+if (Нет READ для узла или видимости предков?) then (да)
+  :Завершить TX. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+:Вычислить logical path по текущим именам UUID-цепочки TREE,
+metadata ETag по n.revision;
+if (If-None-Match соответствует ETag?) then (да)
+  :Завершить TX. Ответ 304 без body;
+  stop
+endif
+if (n.node_type = FILE?) then (да)
+  :Найти file_entry по node_id = nodeId.
+  Если current_version_id не NULL, прочитать file_version
+  и content_object этой версии для size, MIME и SHA-256;
+endif
+:Сформировать Node из n, path и file metadata.
+Для placeholder: currentVersionId = NULL,
+contentRevision = 0, sizeBytes = NULL;
+:Завершить read-only TX;
+}
+:Ответ 200 Node и metadata ETag;
+note right
+Response
+200:
+  Headers:
+    ETag, X-Correlation-Id
+  Content-Type: application/json
+  Body: Node
+    id*, spaceId*, parentId* (null), type*, name*, path*, markers*, revision*
+    status*, createdAt*, updatedAt*, trashedAt? (null), file?
+    file (только FILE):
+      currentVersionId* (null), contentRevision*, sizeBytes* (null)
+      contentType* (null), checksumSha256* (null)
+304:
+  Headers:
+    X-Correlation-Id
+  Body: отсутствует
+Ошибки: application/problem+json
+  type*, title*, status*, code*, detail?, instance?, requestId*, violations?[]
+  correlationId*, traceId? (null)
+  violations?[]: field*, code*, message*
+Обозначения: * обязательное, ? необязательное, (null) допускает null
+end note
+stop
+@enduml

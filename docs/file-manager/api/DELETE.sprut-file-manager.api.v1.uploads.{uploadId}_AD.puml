@@ -1,0 +1,101 @@
+' operationId: abortUploadSession
+' method: DELETE
+' path: /api/v1/uploads/{uploadId}
+' Общие правила REQ, ACL, UPLOAD_ACCESS, FAIL_TRANSFER, ERR: README.md.
+@startuml abortUploadSession_AD
+title Отмена сессии загрузки\nDELETE /sprut-file-manager/api/v1/uploads/{uploadId}
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam partitionBorderColor #7950F2
+skinparam partitionBackgroundColor #F3F0FF
+skinparam activityBackgroundColor #E7F5FF
+|SPRUT-FILE-MANAGER|
+start
+:Request;
+note right
+  Request: DELETE /sprut-file-manager/api/v1/uploads/{uploadId}
+  Path:
+    uploadId*
+  Headers:
+    X-Actor-Id*, X-Actor-Type*, X-Actor-Roles?, X-Actor-Groups?
+    X-Correlation-Id?, traceparent?, tracestate?
+  Body: отсутствует
+  Обозначения: * обязательное, ? необязательное, (null) допускает null
+end note
+:Получить uploadId. Найти upload_session по id
+с JOIN storage_space по configuredTenantId;
+if (Сессия не найдена?) then (да)
+  :Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+partition "TX — отмена session, READ COMMITTED" {
+:BEGIN. storage_space по найденному space_id FOR SHARE.
+Повторно прочитать upload_session u по id = uploadId FOR UPDATE;
+if (Сессия удалена после первоначального поиска?) then (да)
+  :ROLLBACK. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+:Получить target/предков и права по UPLOAD_ACCESS;
+if (Target отсутствует или скрыт по UPLOAD_ACCESS?) then (да)
+  :ROLLBACK. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (u.created_by != actorId и нет ADMIN для target?) then (да)
+  :ROLLBACK. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (s.status = DISABLED?) then (да)
+  :ROLLBACK. Ответ 403 SPACE_DISABLED;
+  stop
+endif
+if (Нет WRITE для target?) then (да)
+  :ROLLBACK. Ответ 403 ACCESS_DENIED;
+  stop
+endif
+if (u.status = COMPLETED?) then (да)
+  :ROLLBACK. Ответ 409 UPLOAD_ALREADY_COMPLETED;
+  stop
+endif
+if (u.status = ABORTED?) then (да)
+  :COMMIT без изменений. Ответ 204;
+  stop
+endif
+if (u.status = EXPIRED или u.expires_at <= now?) then (да)
+  :ROLLBACK. Ответ 410 UPLOAD_EXPIRED;
+  stop
+endif
+if (u.status = FAILED?) then (да)
+  :ROLLBACK. Ответ 409 UPLOAD_WRITER_CONFLICT;
+  stop
+endif
+:Найти текущий upload_attempt по u.current_attempt_id FOR UPDATE;
+:UPDATE upload_session: status = ABORTED, revision += 1.
+Для текущей попытки: lease_token += 1,
+status = ABORTED, lease_owner/lease_until = NULL,
+finished_at = txTime;
+:INSERT gc_task для точных unpublished attempts:
+ABORT_MULTIPART при наличии provider_upload_id,
+DELETE_OBJECT для их content_object после grace.
+Сохранить exact key/provider version по CLEANUP;
+:INSERT audit_event action = UPLOAD_ABORT для uploadId.
+COMMIT;
+}
+:Ответ 204 без ожидания MinIO cleanup;
+note right
+Response
+204:
+  Headers:
+    X-Correlation-Id
+  Body: отсутствует
+Ошибки: application/problem+json
+  type*, title*, status*, code*, detail?, instance?, requestId*, violations?[]
+  correlationId*, traceId? (null)
+  violations?[]: field*, code*, message*
+Обозначения: * обязательное, ? необязательное, (null) допускает null
+
+  DELETE и complete блокируют одну session.
+  ABORTED запрещает позднюю публикацию.
+  READ_ONLY space не мешает отмене неопубликованной загрузки.
+end note
+stop
+@enduml

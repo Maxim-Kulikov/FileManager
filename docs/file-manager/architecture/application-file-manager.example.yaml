@@ -1,0 +1,42 @@
+# Одна конфигурация MinIO и одна OpenSearch для всех пространств.
+# Secrets доставляются извне; limits проверяются нагрузочными тестами.
+server:
+  servlet:
+    context-path: /sprut-file-manager
+sprut:
+  file-manager:
+    tenant-id: "${SPRUT_TENANT_ID}"
+    s3:
+      endpoint: "${SPRUT_S3_ENDPOINT}"
+      region: "${SPRUT_S3_REGION:us-east-1}"
+      bucket: "${SPRUT_S3_BUCKET}"
+      base-prefix: sprut
+      credentials:
+        access-key: "${SPRUT_S3_ACCESS_KEY}"
+        secret-key: "${SPRUT_S3_SECRET_KEY}"
+      tls:
+        verify: true
+      connect-timeout: 5s
+      read-timeout: 60s
+      write-timeout: 60s
+    opensearch:
+      endpoints:
+        - "${SPRUT_OPENSEARCH_ENDPOINT}"
+      index-alias: "${SPRUT_OPENSEARCH_ALIAS:sprut-current}"
+      credentials:
+        username: "${SPRUT_OPENSEARCH_USERNAME}"
+        password: "${SPRUT_OPENSEARCH_PASSWORD}"
+      tls:
+        verify: true
+      connect-timeout: 5s
+      read-timeout: 30s
+    limits:
+      max-depth: 128
+      max-atomic-move-folders: 5000
+      max-page-size: 1000
+      max-concurrent-upload-streams: 8
+      max-file-bytes: 5368709120
+      max-stream-duration: 30m
+# Retention policy создаётся защищённым REST заранее.
+# Администратор задаёт имя пространства, policy ID и initialAccess.
+# YAML не создаёт bucket/index/space автоматически.

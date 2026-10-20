@@ -1,0 +1,63 @@
+' Роли и файловые права.
+@startuml sprut-file-manager-db-administration
+title sprut-file-manager — роли и права файлового доступа
+hide methods
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam nodesep 100
+skinparam ranksep 140
+skinparam padding 2
+
+entity "access_role" as access_role #EBFBEE {
+  .. Допустимые значения ..
+  {field} status = ACTIVE | ARCHIVED
+  == Колонки ==
+  * id : UUID <<PK>> [Постоянный UUID, назначаемый внешней identity-системой пользователю]
+  --
+  * space_id : UUID <<FK>> [Единственное пространство роли; binding в другой space запрещён]
+  * name : VARCHAR(255) [Отображаемое имя; переименование не меняет назначения]
+  description : VARCHAR(1024) [Назначение роли без секретов и персональных данных]
+  * status : VARCHAR(16) [ACTIVE либо ARCHIVED; UUID не переиспользуется]
+  * revision : BIGINT [CAS metadata и атомарной замены состава прав]
+  * created_by : UUID [Пользователь или сервис, создавший роль]
+  * created_at : TIMESTAMPTZ [Время создания роли]
+  * updated_at : TIMESTAMPTZ [Время последнего изменения роли или её прав]
+}
+
+entity "role_permission" as role_permission #EBFBEE {
+  .. Допустимые значения ..
+  {field} permission_code = READ | WRITE | DELETE | SHARE | ADMIN
+  == Колонки ==
+  * role_id : UUID <<PK,FK>> [Роль, содержащая разрешение; компонент PK]
+  * permission_code : VARCHAR(32) <<PK>> [Поддерживаемое кодом действие; компонент PK]
+  --
+  * created_at : TIMESTAMPTZ [Время включения права в роль]
+}
+
+entity "storage_space" as storage_space <<ref>> #FFF9DB
+entity "node_acl" as node_acl <<ref>> #FFF9DB
+
+storage_space ||--o{ access_role : role namespace
+access_role ||--o{ role_permission : fixed permission codes
+access_role |o--o{ node_acl : ROLE binding
+
+note bottom of access_role
+  File Manager хранит роли, права и node bindings, но не user-role membership.
+  Внешняя система получает каталог и назначает role UUID пользователю/сервису.
+  Gateway передаёт подтверждённые roleIds; произвольный caller их не утверждает.
+  Роль без node_acl binding не даёт доступа; platform permissions в эти роли не входят.
+  ADMIN — существующий файловый код управления доступом и scoped admin-операций,
+  не роль администратора сервиса и не автоматический READ/WRITE.
+  Архивированная/неизвестная роль не участвует в вычислении разрешений.
+  Замена прав + revision + audit атомарны; отзыв сериализуется с worker commit.
+  Локальный барьер доступа — exclusive lock storage_space до смены ACL/ролей/прав;
+  Контентные UPDATE publications используют shared lock; structural publications — exclusive.
+  Изменение grants повышает storage_space.authorization_revision в той же TX.
+  Этот номер позволяет валидировать постраничную проверку большого export manifest.
+  effective permissions и role bindings вычисляются запросами, не отдельными таблицами.
+  INDEX(space_id,status,id) для каталога и INDEX(role_id,node_id) активных node_acl для bindings.
+  GET-каталог должен допускать MANAGE_ROLES/scoped ADMIN согласно MVC, не требовать неявного READ.
+  Permission codes фиксированы приложением; platform grants не становятся role_permission.
+  Прямые USER/GROUP/SERVICE grants сохраняются до отдельного решения об их удалении.
+end note
+@enduml

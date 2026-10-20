@@ -1,0 +1,101 @@
+' operationId: headContent
+' method: HEAD
+' path: /api/v1/nodes/{nodeId}/content
+' Общие правила REQ, ACL, ERR: README.md.
+' Любой HEAD-ответ, включая ошибки, возвращается без body.
+@startuml headContent_AD
+title Заголовки содержимого файла\nHEAD /sprut-file-manager/api/v1/nodes/{nodeId}/content
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam partitionBorderColor #7950F2
+skinparam partitionBackgroundColor #F3F0FF
+skinparam activityBackgroundColor #E7F5FF
+|SPRUT-FILE-MANAGER|
+start
+:Request;
+note right
+  Request: HEAD /sprut-file-manager/api/v1/nodes/{nodeId}/content
+  Path:
+    nodeId*
+  Query:
+    versionId?
+  Headers:
+    X-Actor-Id*, X-Actor-Type*, X-Actor-Roles?, X-Actor-Groups?
+    X-Correlation-Id?, traceparent?, tracestate?
+  Body: отсутствует
+  Обозначения: * обязательное, ? необязательное, (null) допускает null
+end note
+:Получить nodeId и необязательный versionId;
+partition "TX — PostgreSQL, REPEATABLE READ (read-only)" {
+:Начать read-only TX REPEATABLE READ;
+:Найти fs_node n по id = nodeId,
+storage_space s по id = n.space_id
+и tenant_id = configuredTenantId;
+if (Узел не найден?) then (да)
+  :Завершить TX. Ответ 404 без body;
+  stop
+endif
+:Получить предков и grants по ACL;
+if (n или предок не ACTIVE?) then (да)
+  :Завершить TX. Ответ 404 без body;
+  stop
+endif
+if (Нет READ для n или видимости предков?) then (да)
+  :Завершить TX. Ответ 404 без body;
+  stop
+endif
+if (s.status = DISABLED?) then (да)
+  :Завершить TX. Ответ 403 без body;
+  stop
+endif
+if (n.node_type != FILE?) then (да)
+  :Завершить TX. Ответ 409 NODE_TYPE_MISMATCH без body;
+  stop
+endif
+:Найти file_entry по node_id = nodeId.
+selectedVersionId = versionId из query,
+при его отсутствии — file_entry.current_version_id;
+if (selectedVersionId IS NULL?) then (да)
+  :Завершить TX. Ответ 409 CONTENT_NOT_READY без body;
+  stop
+endif
+:Найти file_version v по id = selectedVersionId
+и file_node_id = nodeId;
+if (Версия не найдена?) then (да)
+  :Завершить TX. Ответ 404 без body;
+  stop
+endif
+if (v.status = RETIRED?) then (да)
+  :Завершить TX. Ответ 410 VERSION_EXPIRED без body;
+  stop
+endif
+if (v.status != AVAILABLE?) then (да)
+  :Завершить TX. Ответ 409 CONTENT_NOT_READY без body;
+  stop
+endif
+:Найти content_object o по id = v.content_object_id;
+if (o.status != AVAILABLE?) then (да)
+  :Завершить TX. Ответ 503 DEPENDENCY_UNAVAILABLE без body;
+  stop
+endif
+:Сформировать ETag по v.id и o.checksum_sha256,
+Content-Length = o.size_bytes, Content-Type = v.content_type,
+charset = v.charset_name, безопасный Content-Disposition,
+X-Content-Revision-ETag по file_entry.content_revision;
+:Завершить TX;
+}
+:Ответ 200 с заголовками и Accept-Ranges: bytes.
+MinIO не вызывается. Body отсутствует;
+note right
+Response
+200:
+  Headers:
+    ETag, X-Content-Revision-ETag, Accept-Ranges, Content-Length
+    Content-Disposition, X-Correlation-Id, Content-Type
+  Body: отсутствует
+  Content-Type/charset: MIME и charset file_version
+Ошибки: HTTP status и headers, body отсутствует
+Обозначения: * обязательное, ? необязательное, (null) допускает null
+end note
+stop
+@enduml

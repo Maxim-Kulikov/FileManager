@@ -1,0 +1,186 @@
+' PostgreSQL — источник истины и очередь работ; S3 — неизменяемые байты.
+' Каждый .puml содержит одну самостоятельную диаграмму.
+' Обзор: sprut-file-manager-db.puml.
+' Детали: sprut-file-manager-db-{namespace,content,bulk,retention,search-audit,administration}.puml.
+' Пояснения [в скобках] видны на диаграмме; подробные comments и ограничения — в исходнике.
+' <<ref>> — таблица подробно описана в другом файле; это не новая таблица.
+' Ограничения CHECK/FK/UNIQUE и индексы указаны в комментариях.
+
+@startuml sprut-file-manager-db-retention
+title sprut-file-manager — retention, удержание версий и GC
+hide methods
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam nodesep 100
+skinparam ranksep 140
+skinparam padding 2
+skinparam ArrowFontSize 12
+
+entity "retention_policy" as retention_policy #F3F0FF {
+  * id : UUID <<PK>> [ID политики хранения и очистки]
+  --
+  * tenant_id : UUID [Владелец данных; граница изоляции tenant]
+  * name : VARCHAR(255) [Отображаемое имя политики хранения]
+  ' Настраиваемые периоды; конкретные defaults определяются отдельно.
+  * version_retention_days : INTEGER [Сколько дней сохранять версии по возрасту]
+  * min_versions_per_file : INTEGER [Минимум последних версий, сохраняемых для файла]
+  * tree_restore_days : INTEGER [Глубина доступной истории для restore дерева, в днях]
+  * trash_retention_days : INTEGER [Срок хранения узлов в корзине, в днях]
+  * job_rollback_days : INTEGER [Окно компенсации задания, в днях]
+  * job_detail_retention_days : INTEGER [Срок хранения пофайловых деталей задания, в днях]
+  * job_summary_retention_days : INTEGER [Срок хранения сводки задания, в днях]
+  * audit_retention_days : INTEGER [Срок хранения событий аудита, в днях]
+  * gc_grace_hours : INTEGER [Пауза перед удалением объекта после допуска GC, в часах]
+  * orphan_grace_hours : INTEGER [Пауза перед очисткой бесхозной загрузки, в часах]
+  * updated_at : TIMESTAMPTZ [Время последнего изменения записи]
+}
+entity "version_hold" as version_hold #FFF9DB {
+  ' Допустимые значения колонок.
+  .. Допустимые значения ..
+  {field} holder_type = ACTIVE_JOB | JOB_ROLLBACK | RESTORE | INDEX_READ
+  {field} holder_type = USER_PIN | LEGAL_HOLD | SHARE | EXPORT
+  {field} holder_type = CONTENT_READ
+  == Колонки ==
+  * id : UUID <<PK>> [ID удержания версии от очистки]
+  --
+  * version_id : UUID <<FK>> [Версия, защищённая от retirement и GC]
+  ' ACTIVE_JOB / JOB_ROLLBACK / RESTORE / INDEX_READ / USER_PIN / LEGAL_HOLD / SHARE / EXPORT.
+  * holder_type : VARCHAR(32) [Тип причины или владельца удержания]
+  ' Job, пользователь, ссылка, export artifact или активный read.
+  * holder_id : UUID [ID durable владельца удержания; не только ID worker процесса]
+  * created_at : TIMESTAMPTZ [Время создания записи]
+  ' NULL = бессрочно; active job hold не истекает из-за падения worker.
+  expires_at : TIMESTAMPTZ [Срок удержания; NULL означает бессрочное]
+  ' Только устойчивое завершение/истечение доступности операции.
+  released_at : TIMESTAMPTZ [Время снятия удержания; NULL пока оно не снято]
+}
+entity "tree_history_hold" as tree_history_hold #FFF9DB {
+  ' Защищает историю на T во время длительного планирования restore.
+  * id : UUID <<PK>> [ID удержания истории пространства на момент T]
+  --
+  * space_id : UUID <<FK>> [Файловое пространство, которому принадлежит запись]
+  * job_id : UUID <<FK>> [Задание restore, ради которого удерживается история]
+  * restore_to : TIMESTAMPTZ [Защищённый момент T для построения и выполнения restore]
+  * created_at : TIMESTAMPTZ [Время создания записи]
+  ' До завершения планирования/выполнения; падение worker не освобождает hold.
+  released_at : TIMESTAMPTZ [Время снятия защиты; падение worker её не снимает]
+}
+entity "gc_task" as gc_task #E7F5FF {
+  ' Допустимые значения колонок.
+  .. Допустимые значения ..
+  {field} task_type = DELETE_OBJECT | ABORT_MULTIPART
+  {field} task_type = DELETE_LEGACY_SEARCH_DOCUMENT
+  {field} status = PENDING | RUNNING | RETRY | DONE | FAILED
+  == Колонки ==
+  * id : UUID <<PK>> [ID устойчивой задачи физической очистки]
+  --
+  * space_id : UUID <<FK>> [Файловое пространство, которому принадлежит запись]
+  ' DELETE_OBJECT / ABORT_MULTIPART / DELETE_LEGACY_SEARCH_DOCUMENT.
+  * task_type : VARCHAR(64) [Удаление объекта, отмена multipart или очистка legacy index]
+  ' Стабильный ID физической цели для дедупликации.
+  * target_id : UUID [Стабильный ID цели; участвует в дедупликации]
+  content_object_id : UUID <<FK>> [Связанный объект, если задача удаляет его байты]
+  ' Точная цель: key, provider_version_id, upload_id и т.п.; без секретов.
+  * target_snapshot : JSONB [Точная внешняя цель удаления; без credentials]
+  ' PENDING / RUNNING / RETRY / DONE / FAILED.
+  * status : VARCHAR(16) [Состояние выполнения физической очистки]
+  * delete_not_before : TIMESTAMPTZ [Не раньше этого срока разрешено физическое удаление]
+  * attempt : INTEGER [Счётчик попыток выполнения, включая повторы]
+  * next_attempt_at : TIMESTAMPTZ [Не раньше этого времени разрешена следующая попытка]
+  lease_owner : VARCHAR(128) [Worker, временно получивший задачу в обработку]
+  lease_until : TIMESTAMPTZ [Срок действия права worker на обработку задачи]
+  * lease_token : BIGINT [Номер захвата; запрещает commit устаревшего worker]
+  error_code : VARCHAR(64) [Машиночитаемый код последней ошибки]
+  * created_at : TIMESTAMPTZ [Время создания записи]
+  finished_at : TIMESTAMPTZ [Время перехода в конечное состояние]
+}
+entity "file_version" as file_version <<ref>> #EBFBEE
+entity "content_object" as content_object <<ref>> #EBFBEE
+entity "node_revision" as node_revision <<ref>> #FFF9DB
+entity "storage_space" as storage_space <<ref>> #E7F5FF
+entity "upload_attempt" as upload_attempt <<ref>> #E7F5FF
+entity "export_artifact" as export_artifact <<ref>> #FFF9DB
+
+retention_policy ||--o{ storage_space : policy
+storage_space ||--o{ tree_history_hold : retained restore point
+file_version ||--o{ version_hold : protected version
+file_version |o--o{ node_revision : historical reference
+content_object ||--o{ file_version : shared bytes
+content_object |o--o{ gc_task : delete workflow
+content_object ||--o| upload_attempt : attempt reference
+content_object |o--o| export_artifact : artifact reference
+export_artifact ..> version_hold : EXPORT source holds
+
+/' note bottom of file_version
+  Версия сохраняется при ЛЮБОМ условии:
+  current pointer; последние N; возраст внутри retention;
+  active hold; STAGED upload/item; retained node_revision.
+  tree_history_hold сохраняет интервалы на T и их content versions.
+  История сохраняет интервалы окна restore и граничное состояние,
+  даже если исходная версия очень старая.
+  Возраст created_at сам по себе недостаточен для удаления.
+  Сначала очищаются expired references/holds,
+  затем AVAILABLE -> RETIRED; новые holds для RETIRED запрещены.
+'/
+/' note bottom of version_hold
+  UNIQUE(version_id,holder_type,holder_id) WHERE released_at IS NULL.
+  Hold и переход RETIRED сериализуются row lock версии.
+  Base/target/result удерживаются при discovery/commit в той же TX.
+  Terminal job удерживает base/result до rollback_available_until.
+  STOP_AND_ROLLBACK сохраняет holds при pending admission; lease/старое окно не снимают защиту.
+  При создании связанного rollback продление/передача holds выполняется той же TX.
+  COPY удерживает source/base/result; cross-space holds относятся к фактическим source versions.
+  EXPORT holder_id=artifact.id удерживает manifest versions до expiry и окончания read pin.
+  EXPORT holds бессрочны до устойчивого cleanup owner; освобождаются bounded batches.
+  CONTENT_READ: holder_id — ID чтения, expires_at — bounded deadline; renew до expiry либо stop I/O.
+  Direct read удерживает immutable version до закрытия stream; crash освобождается по deadline.
+  Reconciler снимает abandoned holds по устойчивому состоянию владельца.
+  Lease worker не заменяет hold.
+  Запуск rollback атомарно проверяет доступность исходного job
+  и переносит/продлевает необходимые holds на новое задание.
+'/
+/' note bottom of tree_history_hold
+  UNIQUE(job_id) WHERE released_at IS NULL.
+  Создание restore job + проверка watermark + hold атомарны.
+  Эта TX и сдвиг watermark сериализуются lock строки space.
+  Пока restore строит manifest, GC сохраняет состояние space на T.
+  После discovery версии дополнительно удерживаются пофайлово.
+'/
+/' note bottom of gc_task
+  UNIQUE(space_id,task_type,target_id).
+  SKIP LOCKED + lease/token; физическое удаление вне TX.
+  RETIRED version не даёт права удалить общий content_object:
+  отсутствие ВСЕХ STAGED/AVAILABLE file versions проверяется под row lock объекта.
+  Дополнительно проверяются active/verified upload attempts живой session и export artifacts.
+  BUILDING/READY artifact защищает current object при действующем lifecycle/lease/read.
+  Истёкший artifact сохраняет объект/manifest до read_protected_until.
+  Admission read pin и начало GC сериализуются row lock content_object и artifact.
+  Deadline ограничен сервером; stream завершается/продлевает pin до его истечения.
+  Crash reader задерживает cleanup только до bounded deadline, не создаёт вечный hold.
+  Новые object references и READY/VERIFIED переходы запрещены после GC_PENDING.
+  Одна TX: object -> GC_PENDING и INSERT gc_task.
+  После grace удаляем точную цель; NotFound = успех.
+  Затем object -> DELETED; после этого purge metadata.
+  RETIRED row можно удалить раньше, если object жив через другие версии.
+  Сбой между delete и DB commit безопасен: повторяем ту же задачу.
+  FK job/upload/history/attempt/artifact очищаются после завершения и безопасного retention.
+  Cleanup attempts сначала убирает session.current_attempt_id; result replay хранится до expiry.
+  Новый upload attempt не переиспользует старый object key; orphan sweep учитывает все попытки.
+  Multipart abort имеет точный provider_upload_id и durable gc_task до очистки попытки.
+  Late external write не считается отменённым по lease: bounded I/O, abort и reconciliation обязательны.
+'/
+/' note bottom of storage_space
+  T раньше restore_available_from -> RESTORE_POINT_EXPIRED.
+  Watermark и cleanup меняются согласованно.
+  Trash purge учитывает окно restore, descendants и holds.
+  Детали job очищаются после rollback/detail retention и завершения связанных live jobs,
+  summary хранится дольше; audit не содержит блокирующих FK.
+  EXPORT manifest хранится до artifact expiry и read_protected_until, даже если job terminal.
+  Artifact -> EXPIRED запрещает новые downloads; object pin сохраняется до deadline активного чтения.
+  После read pin release EXPORT holds снимаются batches; manifest cleanup ждёт освобождения holds.
+  Unlink object + регистрация gc_task согласованы под object lock с проверкой всех references.
+  Уборка owner rows не оставляет бессрочные orphan holds и не удаляет manifest активного reader.
+  Multipart/orphan sweep ограничен space prefix, grace
+  и повторной проверкой отсутствия живого upload/object.
+'/
+@enduml

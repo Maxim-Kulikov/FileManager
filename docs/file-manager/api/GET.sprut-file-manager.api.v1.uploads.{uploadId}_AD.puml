@@ -1,0 +1,91 @@
+' operationId: getUploadSession
+' method: GET
+' path: /api/v1/uploads/{uploadId}
+' Общие правила REQ, ACL, UPLOAD_ACCESS, ERR: README.md.
+@startuml getUploadSession_AD
+title Состояние сессии загрузки\nGET /sprut-file-manager/api/v1/uploads/{uploadId}
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam partitionBorderColor #7950F2
+skinparam partitionBackgroundColor #F3F0FF
+skinparam activityBackgroundColor #E7F5FF
+|SPRUT-FILE-MANAGER|
+start
+:Request;
+note right
+  Request: GET /sprut-file-manager/api/v1/uploads/{uploadId}
+  Path:
+    uploadId*
+  Headers:
+    X-Actor-Id*, X-Actor-Type*, X-Actor-Roles?, X-Actor-Groups?
+    X-Correlation-Id?, traceparent?, tracestate?
+  Body: отсутствует
+  Обозначения: * обязательное, ? необязательное, (null) допускает null
+end note
+:Получить uploadId из запроса;
+partition "TX — PostgreSQL, REPEATABLE READ (read-only)" {
+:Начать read-only TX REPEATABLE READ;
+:Найти upload_session u по id = uploadId,
+storage_space s по id = u.space_id
+и tenant_id = configuredTenantId;
+if (Сессия не найдена?) then (да)
+  :Завершить TX. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+:Определить target по UPLOAD_ACCESS:
+NEW — target_parent_id, UPDATE — file_node_id,
+COMPLETED — файл result_version_id.
+Получить target, предков и grants по ACL;
+if (Целевой узел отсутствует или скрыт по UPLOAD_ACCESS?) then (да)
+  :Завершить TX. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (s.status = DISABLED?) then (да)
+  :Завершить TX. Ответ 403 SPACE_DISABLED;
+  stop
+endif
+if (u.created_by != actorId и нет ADMIN для target?) then (да)
+  :Завершить TX. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (Нет READ для target?) then (да)
+  :Завершить TX. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+:Найти upload_attempt a по id = u.current_attempt_id
+и upload_session_id = uploadId;
+if (u.current_attempt_id IS NULL?) then (да)
+  :transferStatus = NONE, attemptNumber = 0, uploadedBytes = 0;
+else (есть попытка)
+  :transferStatus = a.status, attemptNumber = a.attempt_number,
+  uploadedBytes = a.uploaded_bytes;
+endif
+:Сформировать Upload из u и текущей a:
+status, expiresAt, expectedSizeBytes, resultVersionId,
+transferStatus, attemptNumber, uploadedBytes, безопасный errorCode;
+:Завершить read-only TX;
+}
+:Ответ 200 Upload;
+note right
+Response
+200:
+  Headers:
+    Location, X-Correlation-Id
+  Content-Type: application/json
+  Body: Upload
+    id*, spaceId*, status*, parentId? (null), fileNodeId? (null)
+    expectedSizeBytes* (null), uploadedBytes*, resultVersionId? (null), expiresAt*
+    createdAt*, errorCode? (null), transferStatus*, attemptNumber*
+Ошибки: application/problem+json
+  type*, title*, status*, code*, detail?, instance?, requestId*, violations?[]
+  correlationId*, traceId? (null)
+  violations?[]: field*, code*, message*
+Обозначения: * обязательное, ? необязательное, (null) допускает null
+
+  GET не запускает новую попытку и не публикует файл.
+  Terminal status возвращается в Upload, а не скрывается.
+  Progress — snapshot одной попытки, не сумма traffic.
+  Object key и provider upload ID не возвращаются.
+end note
+stop
+@enduml

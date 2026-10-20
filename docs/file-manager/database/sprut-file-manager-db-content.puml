@@ -1,0 +1,240 @@
+' PostgreSQL — источник истины и очередь работ; S3 — неизменяемые байты.
+' Каждый .puml содержит одну самостоятельную диаграмму.
+' Обзор: sprut-file-manager-db.puml.
+' Детали: sprut-file-manager-db-{namespace,content,bulk,retention,search-audit,administration}.puml.
+' Пояснения [в скобках] видны на диаграмме; подробные comments и ограничения — в исходнике.
+' <<ref>> — таблица подробно описана в другом файле; это не новая таблица.
+' Ограничения CHECK/FK/UNIQUE и индексы указаны в комментариях.
+
+@startuml sprut-file-manager-db-content
+title sprut-file-manager — версии, попытки загрузки и ZIP-артефакты
+hide methods
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam nodesep 100
+skinparam ranksep 140
+skinparam padding 2
+skinparam ArrowFontSize 12
+
+entity "file_entry" as file_entry <<ref>> #E7F5FF
+entity "file_version" as file_version #EBFBEE {
+  ' Допустимые значения колонок.
+  .. Допустимые значения ..
+  {field} origin = UPLOAD | CORRECTOR | JOB_ROLLBACK
+  {field} origin = TREE_RESTORE | COPY | VERSION_RESTORE
+  {field} status = STAGED | AVAILABLE | RETIRED
+  == Колонки ==
+  * id : UUID <<PK>> [ID версии содержимого файла]
+  --
+  * file_node_id : UUID <<FK>> [Файл, которому принадлежит версия]
+  ' Монотонный номер; номера удалённых версий не переиспользуются.
+  * version_number : BIGINT [Монотонный номер версии файла; не переиспользуется]
+  ' Несколько версий могут ссылаться на одни байты при restore/copy.
+  * content_object_id : UUID <<FK>> [Объект байтов; может переиспользоваться другими версиями]
+  ' Логический ID исходной версии без FK: история может быть очищена.
+  source_version_id : UUID [Исходная версия при copy или restore; без FK]
+  ' UPLOAD / CORRECTOR / JOB_ROLLBACK / TREE_RESTORE / COPY / VERSION_RESTORE.
+  * origin : VARCHAR(32) [Способ появления версии; допустимые значения выше]
+  ' Логические ID для аудита, не блокируют удаление job/item.
+  operation_id : UUID [Создавшая версию операция; логическая ссылка без FK]
+  item_id : UUID [Создавшая версию пофайловая работа; без FK]
+  * content_type : VARCHAR(255) [MIME-тип содержимого этой версии]
+  charset_name : VARCHAR(64) [Кодировка текста; NULL если не определена]
+  ' STAGED / AVAILABLE / RETIRED; RETIRED запрещён для новых работ.
+  * status : VARCHAR(32) [Состояние версии: подготовлена, доступна или выведена]
+  created_by : UUID [Пользователь или сервис, создавший запись]
+  * created_at : TIMESTAMPTZ [Время создания записи]
+  activated_at : TIMESTAMPTZ [Время публикации версии; NULL до публикации]
+  retired_at : TIMESTAMPTZ [Время вывода версии из доступных; NULL до retirement]
+}
+entity "content_object" as content_object #EBFBEE {
+  ' Допустимые значения колонок.
+  .. Допустимые значения ..
+  {field} status = RESERVED | AVAILABLE | GC_PENDING | DELETED
+  == Колонки ==
+  ' Один неизменяемый объект; GC учитывает все ссылающиеся версии.
+  * id : UUID <<PK>> [ID физического неизменяемого объекта]
+  --
+  * space_id : UUID <<FK>> [Файловое пространство, которому принадлежит запись]
+  ' storage_space.key_prefix + objects/{objectId}; без логических имён/папок.
+  * object_key : VARCHAR(1024) [S3 key объекта; не содержит логических имён или путей]
+  ' Если native versioning включён, удаляется точная provider-версия.
+  provider_version_id : VARCHAR(1024) [Точный ID версии S3; NULL без native versioning]
+  ' NULL допустим только до verify, обязательны для AVAILABLE.
+  checksum_sha256 : CHAR(64) [SHA-256 байтов; NULL допустим до проверки загрузки]
+  size_bytes : BIGINT [Размер байтов; NULL допустим до проверки загрузки]
+  ' RESERVED / AVAILABLE / GC_PENDING / DELETED.
+  * status : VARCHAR(32) [Состояние объекта от резервирования до удаления]
+  * created_at : TIMESTAMPTZ [Время создания записи]
+  verified_at : TIMESTAMPTZ [Время проверки размера и checksum]
+  ' Пауза перед удалением для recovery/reconciliation.
+  delete_not_before : TIMESTAMPTZ [Самый ранний срок физического удаления после grace]
+  deleted_at : TIMESTAMPTZ [Время подтверждённого удаления объекта]
+}
+entity "upload_session" as upload_session #E7F5FF {
+  ' Допустимые значения колонок.
+  .. Допустимые значения ..
+  {field} status [active] = INITIATED | UPLOADING | VERIFYING
+  {field} status [terminal] = COMPLETED | ABORTED | EXPIRED | FAILED
+  == Колонки ==
+  * id : UUID <<PK>> [ID сессии загрузки и идемпотентной финализации]
+  --
+  * space_id : UUID <<FK>> [Файловое пространство, которому принадлежит запись]
+  ' Для нового файла обязательна папка назначения.
+  target_parent_id : UUID <<FK>> [Папка назначения при создании нового файла]
+  ' Для update указывается стабильный ID файла.
+  file_node_id : UUID <<FK>> [Существующий файл при обновлении содержимого]
+  base_version_id : UUID <<FK>> [Версия файла, на основе которой начат upload]
+  expected_content_revision : BIGINT [Ожидаемый номер содержимого для CAS при finalize]
+  requested_name : VARCHAR(255) [Имя создаваемого файла; используется вместе с папкой]
+  * content_type : VARCHAR(255) [MIME-тип будущей версии; фиксируется до передачи байтов]
+  charset_name : VARCHAR(64) [Кодировка текста; NULL для бинарных или неопределённых данных]
+  * revision : BIGINT [CAS состояния сессии и выбора текущей попытки]
+  current_attempt_id : UUID <<FK>> [Текущая попытка этой сессии; NULL до первого claim]
+  result_version_id : UUID <<FK>> [Опубликованная версия; NULL до успешного finalize]
+  expected_size_bytes : BIGINT [Заявленный размер; NULL для потока заранее неизвестной длины]
+  expected_checksum_sha256 : CHAR(64) [Заявленный SHA-256 для проверки целостности]
+  ' INITIATED / UPLOADING / VERIFYING / COMPLETED / ABORTED / EXPIRED / FAILED.
+  * status : VARCHAR(32) [Состояние загрузки и её финализации]
+  * created_by : UUID [Пользователь или сервис, создавший запись]
+  * created_at : TIMESTAMPTZ [Время создания записи]
+  * expires_at : TIMESTAMPTZ [Срок жизни сессии; после истечения finalize запрещён]
+  completed_at : TIMESTAMPTZ [Время успешного finalize и публикации версии]
+  last_error_code : VARCHAR(64) [Машиночитаемый код последней ошибки]
+}
+entity "upload_attempt" as upload_attempt #E7F5FF {
+  .. Допустимые значения ..
+  {field} status [active] = RESERVED | UPLOADING | UPLOADED | VERIFYING
+  {field} status [terminal] = VERIFIED | FAILED | ABORTED | EXPIRED
+  == Колонки ==
+  * id : UUID <<PK>> [ID одной попытки передачи байтов; не ID пользовательской команды]
+  --
+  * upload_session_id : UUID <<FK>> [Сессия, которой принадлежит попытка]
+  * attempt_number : INTEGER [Монотонный номер новой попытки внутри сессии]
+  * content_object_id : UUID <<FK>> [Отдельный immutable object key этой попытки]
+  provider_upload_id : VARCHAR(1024) [ID текущего S3 multipart; NULL до создания или без multipart]
+  * status : VARCHAR(16) [Состояние передачи и проверки конкретной попытки]
+  lease_owner : VARCHAR(128) [Worker или HTTP writer, владеющий попыткой]
+  lease_until : TIMESTAMPTZ [Срок права writer обновлять попытку]
+  * lease_token : BIGINT [Fencing номер claim; проверяется вместе с current_attempt_id]
+  * uploaded_bytes : BIGINT [Последний durable snapshot числа переданных байтов; не checksum receipt]
+  progress_updated_at : TIMESTAMPTZ [Время durable snapshot прогресса; NULL до первой записи]
+  uploaded_at : TIMESTAMPTZ [Время получения полного object receipt; NULL до завершения I/O]
+  * created_at : TIMESTAMPTZ [Время резервирования попытки и её object key]
+  finished_at : TIMESTAMPTZ [Время завершения или прекращения этой попытки]
+  last_error_code : VARCHAR(64) [Безопасный код ошибки передачи или проверки]
+}
+entity "export_artifact" as export_artifact #FFF9DB {
+  .. Допустимые значения ..
+  {field} format = ZIP
+  {field} status = PLANNED | BUILDING | READY | FAILED | EXPIRED
+  == Колонки ==
+  * id : UUID <<PK>> [ID готовящегося архива; не файловый узел пользовательского дерева]
+  --
+  * job_id : UUID <<FK>> [Единственное EXPORT-задание, создающее этот артефакт]
+  * space_id : UUID <<FK>> [Пространство размещения архива и граница доступа]
+  content_object_id : UUID <<FK>> [Объект текущей попытки сборки; NULL до резервирования]
+  * format : VARCHAR(16) [Формат артефакта; в текущем контракте только ZIP]
+  * archive_name : VARCHAR(255) [Безопасное имя скачиваемого архива без пути]
+  * status : VARCHAR(16) [Состояние сборки и доступности артефакта]
+  * revision : BIGINT [CAS смены объекта, состояния и завершения сборки]
+  * attempt : INTEGER [Число начатых попыток полной сборки архива]
+  lease_owner : VARCHAR(128) [Worker, собирающий архив]
+  lease_until : TIMESTAMPTZ [Срок права worker завершить текущую сборку]
+  * lease_token : BIGINT [Fencing номер сборки; старый worker не публикует READY]
+  provider_upload_id : VARCHAR(1024) [Multipart ID текущей сборки для recovery и abort]
+  * next_attempt_at : TIMESTAMPTZ [Не раньше этого времени разрешён повтор сборки]
+  * expires_at : TIMESTAMPTZ [Предельный срок доступности артефакта и его manifest]
+  read_protected_until : TIMESTAMPTZ [До какого deadline GC сохраняет объект для начатого bounded download]
+  * created_at : TIMESTAMPTZ [Время регистрации артефакта]
+  ready_at : TIMESTAMPTZ [Время атомарной публикации проверенного ZIP]
+  last_error_code : VARCHAR(64) [Безопасный код ошибки сборки архива]
+}
+entity "bulk_change_job" as bulk_change_job <<ref>> #EBFBEE
+entity "S3 / MinIO" as s3 #FFF9DB
+
+file_entry ||--o{ file_version : history
+file_entry }o--o| file_version : current_version_id
+content_object ||--o{ file_version : immutable bytes
+file_version |o--o{ upload_session : base / result
+upload_session ||--o{ upload_attempt : durable attempts
+upload_attempt |o--o| upload_session : current attempt
+content_object ||--o| upload_attempt : unique attempt key
+bulk_change_job ||--o| export_artifact : EXPORT result
+content_object |o--o| export_artifact : current build / ready bytes
+content_object ..> s3 : key + provider version
+
+/' note bottom of file_version
+  UNIQUE(file_node_id, version_number).
+  current_version_id принадлежит тому же file_node_id.
+  Байты версии неизменяемы; меняется только GC lifecycle.
+  Restore создаёт новую file_version, переиспользуя content_object.
+  Нет новой версии, если результат корректора идентичен исходным байтам.
+  UNIQUE(item_id) WHERE item_id IS NOT NULL AND activated_at IS NOT NULL: один опубликованный результат.
+  VERSION_RESTORE создаёт новую версию, не переключает pointer на старую запись.
+  Source version ID — происхождение; живые base/target/source защищаются holds.
+'/
+/' note bottom of upload_session
+  revision >= 1; expected_size_bytes IS NULL OR expected_size_bytes >= 0.
+  NEW: target_parent_id + requested_name; file_node_id/base/revision содержимого NULL.
+  UPDATE: file_node_id + expected_content_revision; target_parent_id/requested_name NULL.
+  UPDATE пустого placeholder допускает base_version_id=NULL и content_revision=0.
+  target space и file/base version принадлежат одной границе размещения.
+  Composite FK (id,current_attempt_id) -> upload_attempt(upload_session_id,id).
+  result_version_id UNIQUE при наличии; COMPLETED требует опубликованный результат.
+  S3 I/O вне DB транзакции.
+  Finalize проверяет active session, expires_at, current_attempt и VERIFIED receipt.
+  NEW finalize берёт exclusive space lock и повышает authorization_revision; UPDATE — shared lock.
+  Verify + CAS -> версия + current pointer + node_revision
+  + audit + search_index_task в одной короткой транзакции.
+  Retry complete возвращает result_version_id, не перепубликует старую версию.
+  Фактический размер измеряется даже при expected_size_bytes=NULL; byte limit обязателен.
+  Cleanup terminal session: очистить current pointer, затем attempts и session по retention.
+'/ 
+/' note bottom of upload_attempt
+  UNIQUE(upload_session_id,attempt_number); UNIQUE(upload_session_id,id).
+  UNIQUE(content_object_id); attempt_number >= 1; lease_token >= 1; uploaded_bytes >= 0.
+  Новая попытка = новый content_object/key; не перезаписывать объект старой попытки.
+  VERIFIED требует content_object AVAILABLE с размером/checksum/provider receipt.
+  Все commit проверяют lease/token и current_attempt_id родительской session.
+  Истёкший writer не получает право публикации даже после успешного S3 I/O.
+  Новый attempt регистрируется и выбирается в session одной короткой TX.
+  Старый multipart ID сохраняется до подтверждённого abort/reconciliation.
+  Lease не останавливает удалённый I/O; bounded timeout и orphan sweep обязательны.
+  Uploaded bytes — прогресс, не доказательство целостности; SHA-256 в content_object.
+'/ 
+/' note bottom of export_artifact
+  UNIQUE(job_id); job_type=EXPORT и artifact.space_id=job.space_id.
+  UNIQUE(content_object_id) WHERE content_object_id IS NOT NULL.
+  Каждый повтор сборки резервирует новый content_object/key и новый lease token.
+  До смены pointer старый multipart регистрируется как ABORT_MULTIPART gc_task.
+  target_id abort-задачи = ID объекта этой сборки, не повторно используемый artifact.id.
+  Старый объект не исчезает из recovery: RESERVED candidates учитывает orphan sweep.
+  Переход READY требует AVAILABLE object с размером/checksum, ready_at и ещё не истёкшим expires_at.
+  CAS READY проверяет lease/token, cancellation и полноту EXPORT_ENTRY manifest.
+  Manifest хранится в bulk_change_item: source version + archive_entry_path.
+  Failed build не выдаётся как полный ZIP; повтор строит весь архив заново.
+  Download повторно проверяет ACL источников и TTL; signed URL не живёт дольше expires_at.
+  READY до expires_at является самостоятельной живой ссылкой на content_object.
+  Manifest и source holds сохраняются до expiry с учётом активного чтения.
+  Перед выдачей stream короткая TX продлевает read_protected_until под row lock объекта/артефакта.
+  Поток ограничен deadline; продление выполняется до его истечения, иначе чтение прекращается.
+  Потеря процесса не оставляет вечный read pin: защита истекает по bounded deadline.
+  Проверка ACL большого manifest постраничная, не одна длинная TX на все записи.
+  Проверка охватывает стабильную storage_space.authorization_revision; при смене повтор/отказ.
+  Финальный admission берёт shared lock space, сверяет revision и фиксирует read pin в короткой TX.
+  Claim INDEX(next_attempt_at,id) для PLANNED/FAILED; INDEX(lease_until) для BUILDING.
+  Claim требует активный EXPORT job, неистёкший deadline и оставшийся retry budget.
+  revision >= 1; attempt >= 0; lease_token >= 0; формат ZIP; archive_name не содержит пути.
+  Cleanup job/items не удаляет manifest живого артефакта.
+'/ 
+/' note bottom of content_object
+  UNIQUE(space_id, object_key); CHECK(size_bytes >= 0).
+  GC_PENDING запрещает создание новых ссылок.
+  Создание ссылки и начало GC сериализуются row lock объекта.
+  GC учитывает file_version, живые upload_attempt и artifact с действующим TTL/read pin.
+  RESERVED не читается как опубликованный файл; AVAILABLE требует size/checksum/verified_at.
+  Переиспользование объекта не означает дедупликацию по checksum.
+  Native S3 versioning опционален, с ограниченным lifecycle.
+'/
+@enduml

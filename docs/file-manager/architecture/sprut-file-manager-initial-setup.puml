@@ -1,0 +1,50 @@
+@startuml sprut-file-manager-initial-setup
+title sprut-file-manager — общая инфраструктура YAML и создание storage_space
+skinparam defaultFontName Arial
+skinparam defaultFontSize 14
+skinparam shadowing false
+skinparam activityBackgroundColor #E7F5FF
+start
+partition "1. Deployment" {
+  :Подготовить PostgreSQL, MinIO bucket и OpenSearch index/alias;
+  :Задать единые MinIO/OpenSearch в YAML, tenantId, caller trust,
+credentials подставить через защищённую доставку секретов;
+  :Применить Liquibase с расширением ltree,
+загрузить и валидировать YAML snapshot;
+  if (YAML некорректен или binding существующего space несовместим?) then (да)
+    #pink:Отклонить запуск/admission, не переназначать данные;
+    stop
+  endif
+  :Запустить сервис, ноль spaces допустим,
+создать retention policy защищённым REST provisioning;
+}
+partition "2. MVC: создание пространства" {
+  :Администратор проходит gateway SSO,
+File Manager проверяет caller и CREATE_SPACE;
+  :Задать name, retentionPolicyId и initialAccess,
+настройки MinIO/OpenSearch не выбираются;
+  :Проверить инфраструктуру bounded I/O вне TX,
+зафиксировать канонические binding fingerprints;
+  :Короткая TX: space с уникальным prefix + root с tree_path=label(rootId),
+node_revision + initial ACL + audit + index task + idempotency;
+  note right
+    Endpoint/credentials/bucket/index в формах отсутствуют.
+    Prefix: base/spaces/spaceId/; папка — metadata, не S3 marker.
+    Первое space создаётся вручную; повтор не создаёт второй root.
+  end note
+}
+partition "3. MVC: доступ" {
+  :Создать роли и выбрать READ/WRITE/DELETE/SHARE/ADMIN,
+назначить роли или прямые grants узлам;
+  :Внешняя identity-система назначает role UUID пользователям,
+пользовательский frontend использует REST;
+  :Проверить навигацию, upload/download и поиск;
+}
+stop
+legend bottom
+  YAML — единственный источник настроек MinIO/OpenSearch.
+  PostgreSQL — spaces, bindings/fingerprints, ACL, версии и durable jobs.
+  MVC — spaces, роли и ACL; секреты и client configuration не редактируются.
+  Смена размещения требует migration/cutover; ротация credentials — rollout.
+endlegend
+@enduml

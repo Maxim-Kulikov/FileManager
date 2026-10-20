@@ -1,0 +1,131 @@
+' operationId: createSpace
+' method: POST
+' path: /api/v1/spaces
+' Общие правила REQ, IDEMP, HIST, INDEX, ERR: README.md.
+@startuml createSpace_AD
+title Создание пространства\nPOST /sprut-file-manager/api/v1/spaces
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam partitionBorderColor #7950F2
+skinparam partitionBackgroundColor #F3F0FF
+skinparam activityBackgroundColor #E7F5FF
+|SPRUT-FILE-MANAGER|
+start
+:Request;
+note right
+  Request: POST /sprut-file-manager/api/v1/spaces
+  Headers:
+    Idempotency-Key*, X-Actor-Id*, X-Actor-Type*, X-Actor-Roles?
+    X-Actor-Groups?, X-Correlation-Id?, traceparent?, tracestate?
+  Content-Type*: application/json
+  Body:
+    name*, retentionPolicyId*, initialAccess*[]
+    initialAccess[]:
+      subjectType*, subjectId*, permissions*[], inheritanceMode?
+  Обозначения: * обязательное, ? необязательное, (null) допускает null
+end note
+:Получить name, retentionPolicyId, initialAccess и Idempotency-Key;
+if (У caller нет CREATE_SPACE в platform policy?) then (да)
+  :Ответ 403 ACCESS_DENIED;
+  stop
+endif
+if (Нет USER/SERVICE grant READ + ADMIN с SUBTREE?) then (да)
+  :Ответ 422 VALIDATION_ERROR, violations.initialAccess;
+  stop
+endif
+:Найти retention_policy по id = retentionPolicyId
+и tenant_id = configuredTenantId;
+if (Политика не найдена?) then (да)
+  :Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+:Вычислить scope = tenant + actor + createSpace
+и request_hash нормализованной команды.
+Прочитать idempotency_record по scope + key;
+if (Найдена запись с другим request_hash?) then (да)
+  :Ответ 409 IDEMPOTENCY_KEY_REUSED;
+  stop
+endif
+if (Есть сохранённый ответ?) then (да)
+  :Проверить срок и наличие storage_space из resource_id;
+  if (Результат истёк или space физически удалён?) then (да)
+    :Ответ 410 IDEMPOTENCY_RESULT_EXPIRED;
+    stop
+  endif
+  :Ответ 201 с сохранённым Space, без повторного I/O;
+  stop
+endif
+:Вне TX проверить общие MinIO bucket и OpenSearch target
+с ограниченным timeout. Вычислить binding fingerprints
+по физическому размещению, без credentials;
+if (Проверка инфраструктуры не завершилась успешно?) then (да)
+  :Ответ 503 DEPENDENCY_UNAVAILABLE;
+  stop
+endif
+partition "TX — создание пространства, READ COMMITTED" {
+:BEGIN. Зарезервировать idempotency_record по scope + key.
+При конфликте прочитать запись FOR UPDATE;
+if (Конкурентная команда имеет другой request_hash?) then (да)
+  :ROLLBACK. Ответ 409 IDEMPOTENCY_KEY_REUSED;
+  stop
+endif
+if (Конкурентная команда уже сохранила ответ?) then (да)
+  :Проверить срок и наличие результата по IDEMP;
+  if (Результат больше не существует или истёк?) then (да)
+    :ROLLBACK. Ответ 410 IDEMPOTENCY_RESULT_EXPIRED;
+    stop
+  endif
+  :COMMIT без создания space. Ответ 201 с сохранённым Space;
+  stop
+endif
+:Повторно прочитать retention_policy tenant/id FOR SHARE;
+if (Политика удалена?) then (да)
+  :ROLLBACK. Ответ 404 RESOURCE_NOT_FOUND;
+  stop
+endif
+if (Версия YAML snapshot изменилась после проверки?) then (да)
+  :ROLLBACK. Ответ 503 NOT_CONFIGURED;
+  stop
+endif
+:Выделить spaceId и rootId.
+prefix = configuredBasePrefix + /spaces/ + spaceId + /;
+:INSERT storage_space: tenant_id, name,
+binding fingerprints, bucket_name, key_prefix,
+retention_policy_id, status = ACTIVE,
+revision = authorization_revision = 1,
+restore_available_from = created_at = updated_at = txTime;
+:INSERT fs_node корня: id = rootId, space_id = spaceId,
+parent_id = NULL, name = normalized_name = пустая строка,
+tree_path = label(rootId),
+node_type = FOLDER, status = ACTIVE, created_by = actorId,
+created_at = updated_at = txTime, markers = [], revision = search_revision = 1;
+:INSERT node_revision корня с valid_from = txTime.
+INSERT node_acl для каждого initialAccess на rootId;
+:INSERT audit_event action = CREATE для spaceId.
+INSERT search_index_task NODE для rootId по INDEX;
+:Сохранить Space с rootNodeId в idempotency_record:
+resource_id = spaceId, response_status = 201, response_body;
+:COMMIT;
+}
+:Ответ 201 Space, Location и ETag;
+note right
+Response
+201:
+  Headers:
+    Location, ETag, X-Correlation-Id
+  Content-Type: application/json
+  Body: Space
+    id*, name*, rootNodeId*, status*, retentionPolicyId*, restoreAvailableFrom*
+    createdAt*, updatedAt*, revision*
+Ошибки: application/problem+json
+  type*, title*, status*, code*, detail?, instance?, requestId*, violations?[]
+  correlationId*, traceId? (null)
+  violations?[]: field*, code*, message*
+Обозначения: * обязательное, ? необязательное, (null) допускает null
+
+  S3 folder marker не создаётся.
+  Endpoints и credentials не записываются в БД.
+  Создание space не меняет серверный YAML.
+end note
+stop
+@enduml

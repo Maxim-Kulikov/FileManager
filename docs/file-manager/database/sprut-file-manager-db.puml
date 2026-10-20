@@ -1,0 +1,75 @@
+' PostgreSQL — источник истины и очередь работ; S3 — неизменяемые байты.
+' Каждый .puml содержит одну самостоятельную диаграмму.
+' Обзор: sprut-file-manager-db.puml.
+' Детали: sprut-file-manager-db-{namespace,content,bulk,retention,search-audit,administration}.puml.
+' Пояснения [в скобках] видны на диаграмме; подробные comments и ограничения — в исходнике.
+' <<ref>> — таблица подробно описана в другом файле; это не новая таблица.
+' Ограничения CHECK/FK/UNIQUE и индексы указаны в комментариях.
+
+@startuml sprut-file-manager-db
+title sprut-file-manager — PostgreSQL: обзор
+hide methods
+hide stereotypes
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam packageStyle rectangle
+skinparam nodesep 100
+skinparam ranksep 140
+skinparam padding 2
+skinparam ArrowFontSize 12
+
+package "PostgreSQL" #E7F5FF {
+  entity "Namespace\nstorage_space / fs_node / file_entry\nfs_node.markers: TEXT[]\nFOLDER tree_path: LTREE, FILE: NULL" as namespace
+  entity "История структуры\nnode_revision" as history
+  entity "Содержимое и загрузки\nfile_version / content_object\nupload_session / upload_attempt\nexport_artifact" as content
+  entity "Массовые операции\ncorrector_rule_set / corrector_rule_version\nbulk_change_job / bulk_change_scope\nbulk_discovery_cursor / bulk_change_item\nbulk_item_dependency" as bulk
+  entity "Очистка\nretention_policy / version_hold\ntree_history_hold / gc_task" as retention
+  entity "Роли и права\naccess_role / role_permission" as administration
+  entity "Доступ и поиск\nnode_acl / search_index_task / search_index_cursor\naudit_event / idempotency_record" as integration
+}
+entity "S3 / MinIO\nimmutable objects" as s3 #EBFBEE
+entity "OpenSearch\nтекущие документы" as search #FFF9DB
+entity "Серверный YAML\nединые s3 / opensearch\ncredentials — внешняя доставка" as config #F3F0FF
+
+administration --> namespace : role bindings
+namespace --> history : история rename / move / trash / markers
+namespace --> content : текущая версия
+bulk --> namespace : пофайловый CAS
+bulk --> content : базовая и новая версии
+bulk --> retention : удержание версий
+retention --> content : удаление после retention
+content --> s3 : upload / read
+retention --> s3 : повторяемое удаление
+namespace --> integration : задачи в той же транзакции
+integration --> search : PostgreSQL worker
+config ..> namespace : проверка общего размещения
+config ..> content : SDK clients без DB configuration
+
+note bottom of bulk
+  MinIO Java SDK; Liquibase; PostgreSQL/jOOQ.
+  MVC /admin/** и REST /api/v1/** используют общую бизнес-логику.
+  Единые S3/OpenSearch — только YAML; space создаётся без выбора подключения.
+  Запуск без подтверждения; допускается частичный результат.
+  COPY / DELETE / EXPORT / CORRECTOR / RESTORE используют durable jobs.
+  STOP_AND_ROLLBACK = сохранённое намерение и отдельная компенсация.
+  Retry lineage отделён от source_job_id компенсации.
+  Discovery пишет manifest страницами прямо в PostgreSQL.
+  Worker: SKIP LOCKED -> lease -> S3 I/O -> короткий DB commit.
+  Kafka / outbox / inbox для внутренних работ не нужны.
+end note
+note bottom of content
+  Upload session хранит команду; каждый attempt имеет отдельный immutable key.
+  ZIP manifest = EXPORT_ENTRY items, результат = export_artifact.
+  GC учитывает ссылки версий, attempts, artifacts и действующие holds.
+  Metadata CAS набора правил = revision; VERSION_RESTORE — отдельный origin.
+end note
+note bottom of history
+  JOB_ROLLBACK компенсирует один запуск.
+  TREE_RESTORE восстанавливает дерево на момент T.
+  Маркеры входят в metadata и историю узла; отдельной таблицы нет.
+  tree_path — индекс текущих папок из стабильных UUID, не logical path.
+  Rename не меняет tree_path; move атомарно обновляет prefix вложенных папок.
+  Обе операции сохраняют доступную последующую историю.
+  Ноль spaces допустим: первое пространство создаётся вручную в MVC/REST.
+end note
+@enduml
